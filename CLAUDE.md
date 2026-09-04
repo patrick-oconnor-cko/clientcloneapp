@@ -13,6 +13,10 @@ that are expensive to rediscover.
   `confirm == "CLONE"` (or `"CLEANUP"`), and a token. Never collapse those into fewer checks.
 - **Verbs are allowlisted to `{GET, POST, PUT}`** in `clone_apply.ALLOWED_METHODS`. Do not add
   `DELETE` — removal belongs to `clone_cleanup.py` behind its own gate.
+- **Sandbox API keys are manual, optional and sandbox-only.** `server.sandbox_keys` refuses
+  anything not prefixed `sk_sbox_`/`pk_sbox_`. A step reaches the sandbox API only by
+  declaring `auth: "sandbox_secret"|"sandbox_public"`; without the key it is blocked, never
+  sent with the CAT token. The CAT token is always pasted by Patrick; nothing obtains one.
 - **Processing channels and processors can be neither deleted nor deactivated.** Every live run
   leaves a permanent record in sandbox. Prefer scoping a run to one entity.
 - **Never run a live apply or cleanup without being asked explicitly.** A dry run is always

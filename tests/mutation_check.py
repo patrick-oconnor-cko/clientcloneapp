@@ -272,8 +272,8 @@ MUTATIONS = [
 
 
     ("per-step base override ignored (portal read sent to CAT)", "app/clone_apply.py",
-     '            resp, code, err = _send(step.get("base") or base, token, method, path,',
-     '            resp, code, err = _send(base, token, method, path,'),
+     '            resp, code, err = _send(step.get("base") or auth_base or base, bearer, method,',
+     '            resp, code, err = _send(auth_base or base, bearer, method,'),
     ("a 2xx that persisted nothing reported as ordinary differences", "app/clone_apply.py",
      '    elif differ and all(v["clone"] is None for v in differ.values()) \\\n'
      '            and len(differ) == sum(1 for k in pairs if expected.get(k) is not None):',
@@ -497,6 +497,34 @@ MUTATIONS = [
      '    if payload.get("confirm") != "CLEANUP":\n'
      '        return {"error": \'live cleanup requires confirm == "CLEANUP"\'}',
      '    pass'),
+
+    # -- entity scope: a ticked id CAT did not return must refuse, not shrink ----
+    ("missing ticked entity silently dropped from the scope", "app/clone_capture.py",
+     '    return kept, [w for w in wanted if w not in found]',
+     '    return kept, []'),
+    ("scope list ignored — every entity captured regardless of ticks", "app/clone_capture.py",
+     '    kept = [e for e in ents if e.get("id") in wanted_set]',
+     '    kept = list(ents)'),
+
+    # -- sandbox API keys: sandbox-only, and never a silent fallback to CAT ------
+    ("a production API key accepted as a sandbox key", "app/server.py",
+     '        if not val.startswith(prefix):\n'
+     '            return None, f"{label} must be a sandbox key starting with {prefix} — refused"',
+     '        if False:\n'
+     '            return None, "unreachable"'),
+    ("a production key from the local creds file pre-filled into the page", "app/server.py",
+     '            creds.pop(field, None)     # not a sandbox key: never reaches the page',
+     '            pass'),
+    ("sandbox step sent with the CAT token instead of the sandbox key", "app/clone_apply.py",
+     '    return key, SANDBOX_API_BASE, None',
+     '    return token, SANDBOX_API_BASE, None'),
+    ("sandbox step with no key falls back to the CAT token", "app/clone_apply.py",
+     '    if not key:\n'
+     '        return None, None, (f"this step calls the sandbox API and needs the "',
+     '    if not key:\n'
+     '        return token, SANDBOX_API_BASE, None\n'
+     '    if False:\n'
+     '        return None, None, (f"this step calls the sandbox API and needs the "'),
 ]
 
 

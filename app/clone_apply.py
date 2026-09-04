@@ -55,6 +55,40 @@ def unresolved(*objs):
 # confirm gate, and a plan must never be able to destroy anything.
 ALLOWED_METHODS = {"GET", "POST", "PUT"}
 
+# Where a step's bearer comes from. Every step is a CAT call unless it says otherwise. A
+# step that targets the Checkout sandbox API declares auth="sandbox_secret" (or
+# "sandbox_public" for the few tokenisation endpoints that take a public key) and is then
+# sent with that key instead of the CAT token, against SANDBOX_API_BASE unless the step
+# names its own base. The keys are typed into the page per session — never stored, never
+# journalled — and a sandbox step with no key is BLOCKED, never sent with the CAT token.
+SANDBOX_API_BASE = "https://api.sandbox.checkout.com"
+AUTH_MODES = {"cat", "sandbox_secret", "sandbox_public"}
+SANDBOX_KEY_PREFIX = {"sandbox_secret": "sk_sbox_", "sandbox_public": "pk_sbox_"}
+SANDBOX_KEY_LABEL = {"sandbox_secret": "Sandbox Secret Key",
+                     "sandbox_public": "Sandbox Public Key"}
+
+
+def bearer_for(step, token, sandbox_keys):
+    """Return (bearer, base_override, error) for a step's auth mode.
+
+    error is set — and bearer is None — when the step cannot be authenticated as declared;
+    the caller blocks the step. base_override is the sandbox API host for sandbox modes
+    and None for CAT.
+    """
+    mode = step.get("auth") or "cat"
+    if mode not in AUTH_MODES:
+        return None, None, f"unknown auth mode {mode!r}"
+    if mode == "cat":
+        return token, None, None
+    key = (sandbox_keys or {}).get(mode) or ""
+    if not key:
+        return None, None, (f"this step calls the sandbox API and needs the "
+                            f"{SANDBOX_KEY_LABEL[mode]} — supply it in the side panel")
+    if not key.startswith(SANDBOX_KEY_PREFIX[mode]):
+        return None, None, (f"{SANDBOX_KEY_LABEL[mode]} does not look like a sandbox key "
+                            f"(expected {SANDBOX_KEY_PREFIX[mode]}…) — refused")
+    return key, SANDBOX_API_BASE, None
+
 
 def _send(base, token, method, path, body=None, timeout=30):
     method = (method or "POST").upper()
@@ -338,13 +372,18 @@ class Journal:
 
 
 def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
-               pace_seconds=0.35, manual_values=None, journal_path=None):
+               pace_seconds=0.35, manual_values=None, journal_path=None,
+               sandbox_keys=None):
     """Execute or simulate a clone plan.
 
     dry_run=True (the default) opens no sockets at all.
 
     manual_values: {"<step_seq>.<field>": value} — merged into a step's body before
     sending. This is how write-only fields (which capture cannot read) get supplied.
+
+    sandbox_keys: {"sandbox_secret": "sk_sbox_…", "sandbox_public": "pk_sbox_…"} — the
+    Checkout sandbox API keys typed into the page, used ONLY by steps whose auth names
+    them (see bearer_for). Optional; a step that needs one and has none is blocked.
 
     journal_path: for live runs, where to append the crash-safe journal. Strongly
     recommended: without it, a mid-run failure leaves created objects unrecorded.
@@ -373,7 +412,9 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         # and the journal — the only durable record — would show nothing wrong.
         "plan_flags": plan.get("flags") or [],
         "plan_skipped": plan.get("skipped") or [],
-        "plan_counts": plan.get("counts") or {}})
+        "plan_counts": plan.get("counts") or {},
+        # WHICH keys were supplied, never their values — the journal is a durable file.
+        "sandbox_keys_supplied": sorted(k for k, v in (sandbox_keys or {}).items() if v)})
 
     for step in plan.get("steps", []):
         seq, kind = step["seq"], step["kind"]
@@ -391,10 +432,20 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         miss = unresolved(path, body)
         entry = {"seq": seq, "kind": kind, "op": step.get("op"),
                  "method": step["method"], "path": path}
+        # Which credential this step is sent with. Resolved before the dry-run branch so
+        # a dry run shows a sandbox step blocked for a missing key — that is the point of
+        # a dry run — instead of it surfacing live.
+        bearer, auth_base, auth_err = bearer_for(step, token, sandbox_keys)
+        if (step.get("auth") or "cat") != "cat":
+            entry["auth"] = step["auth"]
 
         if miss:
             entry.update(status="blocked", error=f"unresolved placeholders: {', '.join(miss)}")
             problems.append(f"step {seq} ({kind}): unresolved {', '.join(miss)}")
+        elif auth_err:
+            entry.update(status="blocked", error=auth_err)
+            problems.append(f"step {seq} ({kind}): {auth_err}")
+        if miss or auth_err:
             journal.append(entry); jrn.append(entry); failed += 1
             if stop_on_error:
                 skipped = len(plan["steps"]) - seq
@@ -427,9 +478,10 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         method = step.get("method") or "POST"
         for attempt in range(1, attempts + 1):
             # A step may name its own base: the network-tokens portal is a different host
-            # from CAT, and it — not CAT — is where that configuration is read from.
-            resp, code, err = _send(step.get("base") or base, token, method, path,
-                                    None if method.upper() == "GET" else body)
+            # from CAT, and it — not CAT — is where that configuration is read from. A
+            # sandbox-API step gets the sandbox host and its key from bearer_for.
+            resp, code, err = _send(step.get("base") or auth_base or base, bearer, method,
+                                    path, None if method.upper() == "GET" else body)
             ok = 200 <= code < 300
             # a lookup that succeeds but has not been provisioned yet is not done
             if ok and step.get("provides"):

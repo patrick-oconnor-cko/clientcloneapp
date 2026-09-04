@@ -12,7 +12,11 @@
   header{padding:16px 24px;border-bottom:1px solid var(--edge);display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
   header h1{margin:0;font-size:16px;letter-spacing:.2px} header .sub{color:var(--mut);font-size:12px}
   a{color:var(--accent);text-decoration:none;font-size:12px} a:hover{text-decoration:underline}
-  .env{margin-left:auto;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.6px;background:#2f7d4f;color:#fff}
+  /* source-environment toggle: the selected direction is green, the other grey */
+  .mode{margin-left:auto;display:flex;gap:6px}
+  .mode button{padding:4px 12px;border-radius:20px;border:1px solid var(--edge);font-size:11px;font-weight:700;letter-spacing:.4px;cursor:pointer;background:#2a303c;color:#93a0b4}
+  .mode button:hover{color:var(--fg)}
+  .mode button.on{background:#2f7d4f;border-color:#2f7d4f;color:#fff}
   .wrap{display:grid;grid-template-columns:330px 1fr;min-height:calc(100vh - 58px)}
   .side{padding:18px;border-right:1px solid var(--edge);background:var(--panel)}
   label{display:block;margin:14px 0 4px;font-size:12px;color:var(--mut)}
@@ -43,6 +47,10 @@
   .stage.active{border-color:var(--accent)} .stage.done{border-color:#265b34}
   .banner{border:1px solid #5b4a20;background:#221d10;color:#e8d9a8;border-radius:9px;padding:11px 13px;font-size:12.5px;margin-bottom:14px}
   .banner.stop{border-color:#5b2626;background:#211010;color:#f0b4b0}
+  .banner ol.warnlist{margin:10px 0 2px;padding-left:26px}
+  .banner ol.warnlist li{margin:0 0 9px;line-height:1.5}
+  .banner ol.warnlist li b{color:#f3e6bf}
+  .banner .pill{font-size:10.5px;padding:1px 8px;margin:0 0 0 6px;vertical-align:1px}
   .confirm{border:1px solid var(--err);border-radius:9px;padding:12px;margin:10px 0;background:#1a1113}
   .confirm input[type=text]{margin-top:8px}
   .rowbtn{padding:4px 10px;border-radius:6px;border:1px solid var(--edge);cursor:pointer;
@@ -55,7 +63,10 @@
 <header>
   <h1>Clone client</h1>
   <span class="sub">copy an entire client configuration to a new client</span>
-  <span class="env" id="env">SANDBOX</span>
+  <div class="mode" id="mode" title="Where the source client is read from. The clone is always created in sandbox.">
+    <button type="button" data-mode="sandbox" class="on">Sandbox → Sandbox</button>
+    <button type="button" data-mode="prod">Prod → Sandbox</button>
+  </div>
 </header>
 <div class="wrap">
   <div class="side">
@@ -63,6 +74,11 @@
     <input id="src_client" placeholder="cli_..." autocomplete="off"/>
     <label>CAT API key (Bearer token)</label>
     <input id="cat_token" placeholder="eyJ... (Okta bearer)" autocomplete="off"/>
+    <label>Sandbox Secret Key</label>
+    <input id="sbox_sk" type="password" placeholder="sk_sbox_..." autocomplete="off"/>
+    <label>Sandbox Public Key</label>
+    <input id="sbox_pk" placeholder="pk_sbox_..." autocomplete="off"/>
+    <div class="hint">Please ensure you use a fully scoped PK and SK.</div>
     <label>New client name</label>
     <input id="new_name" placeholder="e.g. PTOC Sandbox (clone)" autocomplete="off"/>
 
@@ -104,6 +120,17 @@ const esc=s=>String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").rep
 const API_BASE=(location.origin&&location.origin.startsWith("http"))?location.origin:"http://localhost:8787";
 let PLAN=null, OUTLOOK=null, STAGE=0;   // 0 none · 1 captured · 2 planned · 3 applied
 
+// ---- source environment toggle (top right) ----
+// MODE is where the SOURCE client is read from: "sandbox" (default) or "prod". The clone
+// is always created in sandbox. Nothing branches on it yet — the conditional logic comes
+// later; for now it is the single place that logic will read from.
+let MODE="sandbox";
+function setMode(m){
+  MODE=m;
+  document.querySelectorAll("#mode button").forEach(b=>b.classList.toggle("on",b.dataset.mode===m));
+}
+document.querySelectorAll("#mode button").forEach(b=>{b.onclick=()=>setMode(b.dataset.mode);});
+
 function fmtDur(ms){const s=ms/1000;
   if(s<10)return s.toFixed(1)+"s"; if(s<60)return Math.round(s)+"s";
   const m=Math.floor(s/60),r=Math.round(s%60); return r?`${m}m ${r}s`:`${m}m`;}
@@ -123,33 +150,121 @@ async function post(path,body){
   return {code:r.status, body:await r.json()};
 }
 
+// Credentials travel with every request and live only for its duration. The CAT token is
+// mandatory; the sandbox keys are optional and matter only to steps that call the Checkout
+// sandbox API (the server refuses anything without the sk_sbox_/pk_sbox_ prefix).
+function creds(){
+  const c={cat_token:$("cat_token").value.trim()};
+  const sk=$("sbox_sk").value.trim(), pk=$("sbox_pk").value.trim();
+  if(sk)c.sandbox_sk=sk;
+  if(pk)c.sandbox_pk=pk;
+  return c;
+}
+
 // ---- scope picker: which entities the clone covers ----
-let SCOPE="";   // "" = all entities, otherwise a single ent_ id
+// ENTITIES: what "Load entities" returned (null until loaded). SCOPE: the ticked ids.
+// Nothing loaded => the capture covers every entity; loaded => exactly the ticked ones.
+let ENTITIES=null, SCOPE=null;
+function scopeIds(){
+  return Array.from($("entpick").querySelectorAll('input.entpick:checked')).map(c=>c.value);
+}
+function refreshScope(){
+  SCOPE=scopeIds();
+  const n=SCOPE.length, t=(ENTITIES||[]).length;
+  $("scopecount").innerHTML=n===t?`all ${t} entities`:(n?`${n} of ${t} entities`:'<span class="err">none selected</span>');
+}
+function setAll(on){
+  $("entpick").querySelectorAll('input.entpick').forEach(c=>{c.checked=on;});
+  refreshScope();
+}
 async function loadEntities(){
   const cid=$("src_client").value.trim(), tok=$("cat_token").value.trim();
   if(!cid||!tok){ $("entpick").innerHTML='<span class="err">Client ID and token first</span>'; return; }
   $("loadents").disabled=true; $("entpick").textContent="Loading…";
   try{
-    const {body:j}=await post("/api/clone/entities",{client_id:cid,cat_token:tok});
-    if(j.error){ $("entpick").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return; }
+    const {body:j}=await post("/api/clone/entities",{client_id:cid,...creds()});
+    if(j.error){ $("entpick").innerHTML='<span class="err">'+esc(j.error)+'</span>'; ENTITIES=null; SCOPE=null; return; }
+    ENTITIES=j.entities;
     $("entpick").innerHTML=
-      `<label style="margin:8px 0 2px"><input type="radio" name="scope" value="" checked/>
-         All entities <span class="mut">(${j.entities.length})</span></label>`+
-      j.entities.map(e=>`<label style="margin:2px 0"><input type="radio" name="scope" value="${esc(e.id)}"/>
+      `<div style="margin:8px 0 4px;display:flex;gap:8px;align-items:baseline">
+         <span>Cloning <b id="scopecount"></b></span>
+         <a href="#" id="scopeall">all</a> · <a href="#" id="scopenone">none</a></div>`+
+      j.entities.map(e=>`<label style="margin:2px 0"><input type="checkbox" class="entpick" value="${esc(e.id)}" checked/>
          ${esc(e.name||e.id)} <span class="mut">${esc(e.region||"")} · ${esc(e.status||"")}</span><br>
          <code style="font-size:10px">${esc(e.id)}</code></label>`).join("")+
-      `<div class="mut" style="margin-top:6px">A single entity means a much smaller first run —
-         and most of what a clone creates cannot be deleted afterwards.</div>`;
-    $("entpick").querySelectorAll('input[name=scope]').forEach(r=>{
-      r.onchange=()=>{SCOPE=r.value;};});
+      `<div class="mut" style="margin-top:6px">Tick only the entities you want cloned. Fewer
+         entities means a much smaller first run — and most of what a clone creates cannot be
+         deleted afterwards.</div>`;
+    $("entpick").querySelectorAll('input.entpick').forEach(c=>{c.onchange=refreshScope;});
+    $("scopeall").onclick=e=>{e.preventDefault();setAll(true);};
+    $("scopenone").onclick=e=>{e.preventDefault();setAll(false);};
+    refreshScope();
   } finally { $("loadents").disabled=false; }
+}
+// ---- plan warnings: one numbered entry per finding, at the top of the plan view ----
+// Every plan flag mirrors its message into warnings; a few plain warnings have no flag.
+// Match the two by message so structured flags get a label and a "still created" marker.
+const FLAG_LABELS={
+  currency_not_available:"Currency not available",
+  currency_validation_unavailable:"Currency check unavailable",
+  routing_rule_scope_emptied:"Routing rule would match nothing",
+  routing_rule_orphaned:"Routing rule orphaned",
+  catch_all_routing_rule_missing:"Catch-all rule missing",
+  manual_processor_not_creatable:"Manual processor",
+  sessions_link_orphaned:"Sessions link orphaned",
+  sessions_link_unresolved:"Sessions link unresolved",
+  sessions_processor_not_profile_backed:"Sessions processor not profile-backed",
+  legal_entity_codes_unresolved:"Legal entity codes unresolved",
+  source_caid_carried:"Source CAID carried",
+  service_key_unmappable:"Service key unmappable",
+  payout_route_unrecognised:"Payout route unrecognised",
+  risk_settings_not_captured:"Risk settings not captured",
+  compass_settings_not_captured:"Compass settings not captured",
+  flow_account_not_captured:"Flow account not captured",
+  network_tokens_manual:"Network tokens — manual step",
+  network_tokens_not_captured:"Network tokens not captured",
+  network_tokens_default_entity_not_in_scope:"Network tokens — entity out of scope",
+  network_tokens_default_entity_unreadable:"Network tokens unreadable",
+};
+const ACTION_PILLS={
+  dropped:'<span class="pill ok">object still created — only this value is left out</span>',
+  substituted:'<span class="pill warn">value substituted</span>',
+  not_created:'<span class="pill err">not created</span>',
+  not_supplied:'<span class="pill warn">needs a value from you</span>',
+  carried:'<span class="pill warn">source value carried</span>',
+  not_checked:'<span class="pill mut">not checked</span>',
+};
+function renderWarnings(warns, flags){
+  if(!warns.length) return "";
+  const byMsg=new Map(flags.map(f=>[f.message,f]));
+  const items=warns.map(w=>{
+    const f=byMsg.get(w);
+    const label=f?(FLAG_LABELS[f.code]||f.code.replace(/_/g," ")):"Warning";
+    const pill=f&&ACTION_PILLS[f.action]?" "+ACTION_PILLS[f.action]:"";
+    return `<li><b>${esc(label)}</b>${pill}<br>${esc(w)}</li>`;});
+  return `<div class="banner"><b>${warns.length} warning${warns.length===1?"":"s"}</b> —
+    review before applying. Each is a finding the plan works around; none stops the run.
+    <ol class="warnlist">${items.join("")}</ol></div>`;
+}
+
+function scopeLabel(){
+  if(!ENTITIES||!SCOPE)return "all entities";
+  if(SCOPE.length===ENTITIES.length)return `all ${ENTITIES.length} entities`;
+  const byId=Object.fromEntries(ENTITIES.map(e=>[e.id,e.name||e.id]));
+  return `${SCOPE.length} of ${ENTITIES.length} entities — `+SCOPE.map(id=>byId[id]||id).join(", ");
 }
 
 async function capture(){
-  const body={client_id:$("src_client").value.trim(),cat_token:$("cat_token").value.trim(),
-              new_client_name:$("new_name").value.trim(),only_entity:SCOPE};
+  const body={client_id:$("src_client").value.trim(),...creds(),
+              new_client_name:$("new_name").value.trim()};
   if(!body.client_id||!body.cat_token){
     $("status").innerHTML='<span class="err">Source Client ID and token are required</span>'; return;}
+  if(ENTITIES){
+    // Send the ticked ids only when they are a real subset; every box ticked is "all",
+    // which is what an unloaded list means too.
+    if(!SCOPE.length){ $("status").innerHTML='<span class="err">Tick at least one entity to clone</span>'; return; }
+    if(SCOPE.length<ENTITIES.length) body.only_entities=SCOPE;
+  }
   $("capture").disabled=true;
   $("status").textContent="Reading source configuration…"; $("status").className="hint";
   const t0=performance.now();
@@ -306,9 +421,8 @@ function renderPlan(j,el){
     <h2>${esc(PLAN.target.client_name||"Clone")}
       <span class="mut">— ${steps.length} calls · ${ents.length} entities · from
       ${esc(PLAN.source.client_name||PLAN.source.client_id)}</span></h2>
-    <p class="mut">Scope: <b>${SCOPE?esc(SCOPE):"all entities"}</b></p>
-    ${warns.length?`<div class="banner"><b>${warns.length} warning(s)</b><br>`+
-        warns.map(esc).join("<br>")+`</div>`:''}
+    <p class="mut">Scope: <b>${esc(scopeLabel())}</b></p>
+    ${renderWarnings(warns, PLAN.flags||[])}
     ${tree}
     <h3>Will NOT be created <span class="mut">— ${skipped.length}</span></h3>
     <table><tr><th>Item</th><th>Why</th></tr>
@@ -392,7 +506,7 @@ async function apply(){
   let j, code;
   try{
     ({code,body:j}=await post("/api/clone/apply",
-      {plan:PLAN,cat_token:$("cat_token").value.trim(),dry_run:false,confirm:"CLONE",
+      {plan:PLAN,...creds(),dry_run:false,confirm:"CLONE",
        manual_values:MANUAL}));
   }catch(e){
     // network died / non-JSON response / token expired mid-run. Objects may still have
@@ -465,7 +579,7 @@ async function verifyRun(){
   let j;
   try{
     ({body:j}=await post("/api/clone/verify",
-      {created_objects:LASTRUN.created_objects,cat_token:$("cat_token").value.trim()}));
+      {created_objects:LASTRUN.created_objects,...creds()}));
   }catch(e){ $("verifyview").innerHTML='<span class="err">'+esc(e)+'</span>'; return; }
   if(j.error){ $("verifyview").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return; }
   VERIFY=j; drawVerify();
@@ -531,7 +645,7 @@ async function undoOne(i){
   try{
     ({body:j}=await post("/api/clone/cleanup",
       {created_objects:[obj],plan:PLAN,dry_run:false,confirm:"CLEANUP",
-       cat_token:$("cat_token").value.trim()}));
+       ...creds()}));
   }catch(e){
     if(cell) cell.innerHTML='<span class="err">failed</span>';
     $("cleanview").innerHTML='<div class="banner stop">Request failed: '+esc(e)+
@@ -567,7 +681,7 @@ async function cleanupSelected(){
   try{
     ({body:j}=await post("/api/clone/cleanup",
       {created_objects:objs,plan:PLAN,dry_run:false,confirm:"CLEANUP",
-       cat_token:$("cat_token").value.trim()}));
+       ...creds()}));
   }catch(e){
     $("cleanview").innerHTML='<div class="banner stop">Request failed: '+esc(e)+
       '<br>Check <code>clone-runs/</code> — some removals may have gone through.</div>';
@@ -628,7 +742,7 @@ async function cleanupRun(){
   const t0=performance.now();
   const {body:j}=await post("/api/clone/cleanup",
     {created_objects:LASTRUN.created_objects,plan:PLAN,dry_run:false,confirm:"CLEANUP",
-     cat_token:$("cat_token").value.trim()});
+     ...creds()});
   const el=fmtDur(performance.now()-t0);
   if(j.error){ $("status").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return; }
   const r=j.run, c=r.counts;
@@ -652,9 +766,13 @@ function dlPlan(){const b=new Blob([JSON.stringify(PLAN,null,2)],{type:"applicat
   a.download="clone-plan.json";a.click();}
 function copyPlan(){navigator.clipboard.writeText(JSON.stringify(PLAN,null,2));}
 
+// Prefill from the server's dev-creds files (the sandbox keys come from the gitignored
+// dev-creds.local.json). The CAT token is never cached — it is pasted every session.
 if(window.__DEV_CREDS__){const c=window.__DEV_CREDS__;
   if(c.client_id&&$("src_client"))$("src_client").value=c.client_id;
-  if(c.cat_token&&$("cat_token"))$("cat_token").value=c.cat_token;}
+  if(c.cat_token&&$("cat_token"))$("cat_token").value=c.cat_token;
+  if(c.sandbox_sk&&$("sbox_sk"))$("sbox_sk").value=c.sandbox_sk;
+  if(c.sandbox_pk&&$("sbox_pk"))$("sbox_pk").value=c.sandbox_pk;}
 $("capture").onclick=capture;
 $("loadents").onclick=loadEntities;
 drawStages();

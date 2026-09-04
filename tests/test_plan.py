@@ -147,7 +147,7 @@ class TestReferencePlan(unittest.TestCase):
         problems = cc.validate_plan(self.plan)
         self.assertEqual(len(problems), len(self.EXPECTED_FLAG_CODES))
         for p in problems:
-            self.assertTrue(p.startswith("warning: NETWORK TOKENS"), p)
+            self.assertTrue(p.startswith("warning: NETWORK TOKEN SETTINGS"), p)
 
     def test_no_warnings_beyond_the_known_prerequisites(self):
         self.assertEqual(sorted(f["code"] for f in self.plan["flags"]),
@@ -670,6 +670,34 @@ class TestProfileCreateBody(unittest.TestCase):
                                 for w in plan["warnings"]), code)
             # the run continues: nothing is skipped and the step count is unchanged
             self.assertEqual(len(plan["steps"]), EXPECTED_STEPS, code)
+            # ...and the warning SAYS so: a dropped currency must never read as a
+            # dropped profile. The operator reads this banner before applying.
+            f = next(x for x in plan["flags"] if x["code"] == "currency_not_available"
+                     and x["currency"] == code)
+            self.assertEqual(f["action"], "dropped")
+            self.assertIn("will still be created", f["message"], code)
+            self.assertIn(code, f["message"])
+
+    def test_every_dropped_currency_warning_says_the_object_survives(self):
+        # Across every kind that drops a currency (profile, processor, routing rule,
+        # compass): action "dropped" == the object is still created, and the message must
+        # make that explicit. Only a currency ACCOUNT in a dead currency is not created.
+        caps = [fx.reference_capture(), fx.routing_rule_currency_capture(),
+                fx.processor_stale_currency_capture(), fx.stale_currency_capture(),
+                fx.dropped_currency_account_capture()]
+        seen = set()
+        for cap in caps:
+            for f in plan_for(cap)["flags"]:
+                if f["code"] != "currency_not_available":
+                    continue
+                seen.add(f["action"])
+                if f["action"] == "dropped":
+                    self.assertRegex(f["message"], r"will still be (created|applied)", f)
+                else:
+                    self.assertEqual(f["action"], "not_created", f)
+                    self.assertEqual(f["kind"], "currency_account", f)
+                    self.assertIn("not created", f["message"], f)
+        self.assertIn("dropped", seen)
 
     def test_hrk_becomes_eur_without_duplicating_it(self):
         cap = fx.stale_currency_capture()
@@ -860,8 +888,10 @@ class TestClientNetworkTokens(unittest.TestCase):
         self.assertEqual(src["default_provision_mode"], "sync")
         self.assertEqual((src["onboard_visa"], src["onboard_mastercard"]), (True, True))
         self.assertEqual(self.flag["source"], "nt-portal")
-        for phrase in ("VAS pricing", "identification_value", "webpage URL"):
-            self.assertIn(phrase, self.flag["message"])
+        # The message is the one-line instruction Patrick asked for (2026-09-04); the
+        # detail of what to replicate lives in source_configuration, asserted above.
+        self.assertEqual(self.flag["message"],
+                         "NETWORK TOKEN SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION STORE")
 
     def test_nothing_generated_by_onboarding_is_in_the_summary(self):
         blob = json.dumps(self.flag)
@@ -1813,7 +1843,7 @@ class TestMultiEntity(unittest.TestCase):
 
     def test_validate_plan_reports_only_the_known_prerequisites(self):
         for p in cc.validate_plan(self.plan):
-            self.assertTrue(p.startswith("warning: NETWORK TOKENS"), p)
+            self.assertTrue(p.startswith("warning: NETWORK TOKEN SETTINGS"), p)
 
     def test_network_tokens_manual_flag_is_raised_once(self):
         self.assertEqual(steps_of(self.plan, "client_network_tokens"), [])
@@ -1961,6 +1991,234 @@ class TestSafetyGates(unittest.TestCase):
     def test_a_plan_without_steps_is_rejected(self):
         for bad in (None, {}, {"steps": []}, "nope"):
             self.assertIn("error", server.clone_apply_handler({"plan": bad}))
+
+
+class TestEntityScope(unittest.TestCase):
+    """The entity picker is tick boxes: any subset of a client's entities can be cloned.
+    A ticked id that CAT does not return must refuse the capture, never shrink it."""
+
+    ENTS = [{"id": fx._id("ent", f"scope{i}"), "name": f"E{i}"} for i in range(3)]
+
+    def test_no_scope_keeps_every_entity(self):
+        kept, missing = cc.scope_entities(self.ENTS)
+        self.assertEqual(kept, self.ENTS); self.assertEqual(missing, [])
+        kept, missing = cc.scope_entities(self.ENTS, only_entities=[])
+        self.assertEqual(kept, self.ENTS); self.assertEqual(missing, [])
+
+    def test_a_list_keeps_exactly_the_ticked_entities_in_cat_order(self):
+        ids = [self.ENTS[2]["id"], self.ENTS[0]["id"]]      # ticked out of order
+        kept, missing = cc.scope_entities(self.ENTS, only_entities=ids)
+        self.assertEqual([e["id"] for e in kept], [self.ENTS[0]["id"], self.ENTS[2]["id"]])
+        self.assertEqual(missing, [])
+
+    def test_the_single_id_form_still_works(self):
+        kept, missing = cc.scope_entities(self.ENTS, only_entity=self.ENTS[1]["id"])
+        self.assertEqual([e["id"] for e in kept], [self.ENTS[1]["id"]])
+        self.assertEqual(missing, [])
+
+    def test_a_ticked_id_cat_did_not_return_is_reported_not_dropped(self):
+        ghost = fx._id("ent", "ghost")
+        kept, missing = cc.scope_entities(self.ENTS, only_entities=[self.ENTS[0]["id"], ghost])
+        self.assertEqual([e["id"] for e in kept], [self.ENTS[0]["id"]])
+        self.assertEqual(missing, [ghost])
+
+    def test_handler_passes_the_ticked_ids_normalised(self):
+        cap = fx.reference_capture()
+        ids = [" " + self.ENTS[1]["id"], self.ENTS[0]["id"], self.ENTS[0]["id"], ""]
+        with mock.patch.object(server.cc, "capture", return_value=cap) as c, \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()), NoSocket():
+            out = server.clone_capture_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t",
+                                                "only_entities": ids})
+        self.assertIn("plan", out)
+        self.assertEqual(c.call_args.kwargs["only_entities"],
+                         sorted([self.ENTS[0]["id"], self.ENTS[1]["id"]]))
+        self.assertIsNone(c.call_args.kwargs["only_entity"])
+
+    def test_handler_refuses_when_a_ticked_entity_is_missing(self):
+        cap = fx.reference_capture()
+        cap["scope_missing"] = [fx._id("ent", "ghost")]
+        with mock.patch.object(server.cc, "capture", return_value=cap), \
+             mock.patch.object(server.cc, "build_plan") as bp, \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()), NoSocket():
+            out = server.clone_capture_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t",
+                                                "only_entities": [fx._id("ent", "ghost")]})
+        self.assertIn("error", out)
+        self.assertIn("ghost", out["error"])
+        self.assertNotIn("plan", out)
+        bp.assert_not_called()
+
+    def test_handler_rejects_a_non_list_scope(self):
+        with mock.patch.object(server.cc, "capture") as c, NoSocket():
+            out = server.clone_capture_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t",
+                                                "only_entities": "ent_x"})
+        self.assertIn("error", out); c.assert_not_called()
+
+
+def _tmp_runs_dir():
+    import tempfile, pathlib as _pl
+    return _pl.Path(tempfile.mkdtemp())
+
+
+class TestSandboxKeys(unittest.TestCase):
+    """The optional Sandbox Secret / Public Keys: typed into the page, sent with every
+    request, refused unless sandbox-prefixed, used ONLY by steps that declare a sandbox
+    auth mode, and never written to a journal."""
+
+    SK, PK = "sk_sbox_" + "a" * 32, "pk_sbox_" + "b" * 32
+    PROD_SK = "sk_" + "c" * 36            # a production-shaped key
+
+    @staticmethod
+    def sandbox_plan(auth="sandbox_secret"):
+        return {"plan_version": 1, "source": {"client_id": fx.SOURCE_CLIENT},
+                "target": {"client_name": "t"},
+                "steps": [{"seq": 1, "kind": "sandbox_probe", "op": "Sandbox_Probe",
+                           "method": "GET", "path": "/workflows", "auth": auth,
+                           "label": "probe"}]}
+
+    def test_a_production_key_is_refused_on_every_route(self):
+        cat_plan = plan_for(fx.reference_capture())
+        objs = [{"seq": 1, "kind": "currency_account", "new_id": fx._id("ca", "new"),
+                 "path": "/x"}]
+        with NoSocket(), mock.patch.object(server.cc, "capture") as cap, \
+             mock.patch.object(server.capp, "apply_plan") as ap:
+            outs = [
+                server.clone_capture_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t",
+                                              "sandbox_sk": self.PROD_SK}),
+                server.clone_entities_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t",
+                                               "sandbox_pk": "pk_" + "d" * 36}),
+                server.clone_apply_handler({"plan": cat_plan, "sandbox_sk": self.PROD_SK}),
+                server.clone_verify_handler({"created_objects": objs, "cat_token": "t",
+                                             "sandbox_sk": self.PROD_SK}),
+                server.clone_cleanup_handler({"created_objects": objs,
+                                              "sandbox_sk": self.PROD_SK}),
+            ]
+            cap.assert_not_called(); ap.assert_not_called()
+        for out in outs:
+            self.assertIn("error", out)
+            self.assertIn("refused", out["error"])
+            self.assertIn("sk_sbox_" if "Secret" in out["error"] else "pk_sbox_", out["error"])
+
+    def test_sandbox_prefixed_keys_are_accepted_and_reach_apply(self):
+        with NoSocket(), mock.patch.object(server.capp, "apply_plan",
+                                          wraps=server.capp.apply_plan) as ap:
+            out = server.clone_apply_handler({"plan": self.sandbox_plan(),
+                                              "sandbox_sk": f"  {self.SK} ",
+                                              "sandbox_pk": self.PK})
+        self.assertNotIn("error", out)
+        self.assertEqual(ap.call_args.kwargs["sandbox_keys"],
+                         {"sandbox_secret": self.SK, "sandbox_public": self.PK})
+        self.assertEqual(out["run"]["counts"]["failed"], 0)
+
+    def test_absent_keys_do_not_affect_a_cat_only_plan(self):
+        plan = plan_for(fx.reference_capture())
+        with NoSocket():
+            run = capp.apply_plan(plan)          # no sandbox_keys at all
+        self.assertEqual(run["counts"]["failed"], 0)
+        self.assertFalse(any("auth" in e for e in run["journal"]))
+
+    def test_a_sandbox_step_without_its_key_is_blocked_in_a_dry_run(self):
+        with NoSocket():
+            run = capp.apply_plan(self.sandbox_plan())
+        e = run["journal"][0]
+        self.assertEqual(e["status"], "blocked")
+        self.assertEqual(e["auth"], "sandbox_secret")
+        self.assertIn("Sandbox Secret Key", e["error"])
+        self.assertEqual(run["counts"]["failed"], 1)
+        self.assertTrue(any("Sandbox Secret Key" in p for p in run["problems"]))
+
+    def test_a_sandbox_step_without_its_key_is_never_sent_live(self):
+        # The one thing that must not happen: falling back to the CAT token.
+        with mock.patch.object(capp, "_send") as send, \
+             mock.patch("time.sleep", lambda *a, **k: None):
+            run = capp.apply_plan(self.sandbox_plan("sandbox_public"), base="https://cat",
+                                  token="cat-token", dry_run=False, pace_seconds=0,
+                                  sandbox_keys={"sandbox_secret": self.SK})
+        send.assert_not_called()
+        self.assertEqual(run["journal"][0]["status"], "blocked")
+        self.assertIn("Sandbox Public Key", run["journal"][0]["error"])
+
+    def test_a_sandbox_step_is_sent_with_the_key_against_the_sandbox_host(self):
+        with mock.patch.object(capp, "_send", return_value=({"id": "wf_1"}, 200, None)) as send, \
+             mock.patch("time.sleep", lambda *a, **k: None):
+            run = capp.apply_plan(self.sandbox_plan(), base="https://cat", token="cat-token",
+                                  dry_run=False, pace_seconds=0,
+                                  sandbox_keys={"sandbox_secret": self.SK})
+        send.assert_called_once()
+        base, bearer, method, path, body = send.call_args.args[:5]
+        self.assertEqual(base, capp.SANDBOX_API_BASE)
+        self.assertEqual(bearer, self.SK)
+        self.assertNotEqual(bearer, "cat-token")
+        self.assertEqual((method, path), ("GET", "/workflows"))
+        self.assertEqual(run["journal"][0]["status"], 200)
+        self.assertEqual(run["journal"][0]["auth"], "sandbox_secret")
+
+    def test_a_cat_step_still_uses_the_cat_token_when_keys_are_present(self):
+        plan = self.sandbox_plan("cat")
+        with mock.patch.object(capp, "_send", return_value=({"id": "x"}, 200, None)) as send, \
+             mock.patch("time.sleep", lambda *a, **k: None):
+            capp.apply_plan(plan, base="https://cat", token="cat-token", dry_run=False,
+                            pace_seconds=0, sandbox_keys={"sandbox_secret": self.SK})
+        base, bearer = send.call_args.args[:2]
+        self.assertEqual((base, bearer), ("https://cat", "cat-token"))
+
+    def test_an_unknown_auth_mode_is_blocked(self):
+        with NoSocket():
+            run = capp.apply_plan(self.sandbox_plan("production"))
+        self.assertEqual(run["journal"][0]["status"], "blocked")
+        self.assertIn("unknown auth mode", run["journal"][0]["error"])
+
+    def test_dev_creds_merge_the_local_file_over_the_tracked_one(self):
+        import tempfile, pathlib as _pl
+        with tempfile.TemporaryDirectory() as tmp:
+            tracked, local = _pl.Path(tmp) / "a.json", _pl.Path(tmp) / "b.json"
+            tracked.write_text(json.dumps({"client_id": fx.SOURCE_CLIENT}))
+            local.write_text(json.dumps({"sandbox_sk": self.SK, "sandbox_pk": self.PK}))
+            out = server.dev_creds((tracked, local))
+            self.assertEqual(out, {"client_id": fx.SOURCE_CLIENT,
+                                   "sandbox_sk": self.SK, "sandbox_pk": self.PK})
+            # a missing local file contributes nothing and breaks nothing
+            self.assertEqual(server.dev_creds((tracked, _pl.Path(tmp) / "absent.json")),
+                             {"client_id": fx.SOURCE_CLIENT})
+            local.write_text("not json")
+            self.assertEqual(server.dev_creds((tracked, local)), {"client_id": fx.SOURCE_CLIENT})
+
+    def test_dev_creds_never_prefill_a_non_sandbox_key(self):
+        import tempfile, pathlib as _pl
+        with tempfile.TemporaryDirectory() as tmp:
+            local = _pl.Path(tmp) / "b.json"
+            local.write_text(json.dumps({"sandbox_sk": self.PROD_SK, "sandbox_pk": self.PK,
+                                         "client_id": fx.SOURCE_CLIENT}))
+            out = server.dev_creds((local,))
+        self.assertNotIn("sandbox_sk", out)
+        self.assertEqual(out["sandbox_pk"], self.PK)
+        self.assertNotIn(self.PROD_SK, json.dumps(out))
+
+    def test_the_local_creds_file_is_gitignored(self):
+        # The cache exists precisely so the keys are never committed.
+        import pathlib as _pl, subprocess
+        root = _pl.Path(server.HERE).parent
+        r = subprocess.run(["git", "check-ignore", "-q", "app/dev-creds.local.json"],
+                           cwd=root, capture_output=True)
+        if r.returncode == 128:
+            self.skipTest("not a git checkout")
+        self.assertEqual(r.returncode, 0, "app/dev-creds.local.json is not gitignored")
+
+    def test_keys_never_reach_the_run_document_or_the_journal_file(self):
+        import tempfile, pathlib as _pl
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(capp, "_send", return_value=({"id": "wf_1"}, 200, None)), \
+             mock.patch("time.sleep", lambda *a, **k: None):
+            jp = _pl.Path(tmp) / "j.jsonl"
+            run = capp.apply_plan(self.sandbox_plan(), base="https://cat", token="cat-token",
+                                  dry_run=False, pace_seconds=0, journal_path=str(jp),
+                                  sandbox_keys={"sandbox_secret": self.SK,
+                                                "sandbox_public": self.PK})
+            text = jp.read_text()
+        for secret in (self.SK, self.PK, "cat-token"):
+            self.assertNotIn(secret, json.dumps(run))
+            self.assertNotIn(secret, text)
+        header = json.loads(text.splitlines()[0])["_header"]
+        self.assertEqual(header["sandbox_keys_supplied"], ["sandbox_public", "sandbox_secret"])
 
 
 # ---------------------------------------------------------------- cleanup

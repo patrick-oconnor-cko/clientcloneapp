@@ -8,8 +8,23 @@
   finished. That step has since been removed (see below); a plan built from the same
   capture now yields **86 steps, none optional**. 3-entity reference client
   `cli_scna7ew7mxdenl3h36zlmkyh6m`.
-- **Tests:** `python3 tests/test_plan.py` → 198 pass. `python3 tests/mutation_check.py` →
-  97/97 mutants caught. Both need no token or network.
+- **Tests:** `python3 tests/test_plan.py` → 218 pass. `python3 tests/mutation_check.py` →
+  103/103 mutants caught. Both need no token or network.
+- **Warnings render as a numbered list** at the top of the plan view, each labelled by
+  flag code with an action pill; a dropped currency reads "X will still be created, but
+  CUR cannot be added and is left out of…" so it is never mistaken for a dropped object.
+- **Sandbox keys are cached locally** in `app/dev-creds.local.json` (gitignored, mode 600)
+  and prefilled by `server.dev_creds`; non-sandbox values are dropped before injection. The
+  CAT token is never cached.
+- **Entity picker is tick boxes (2026-09-04):** any subset of entities can be cloned; the
+  page sends `only_entities[]` (the single `only_entity` still works). A ticked id CAT does
+  not return makes the capture handler **refuse** (`scope_missing`), never plan a smaller
+  clone.
+- **Sandbox API keys (2026-09-04):** the page has optional `Sandbox Secret Key` /
+  `Sandbox Public Key` fields, sent with every request; the server refuses non-`_sbox_`
+  keys; `clone_apply` steps opt in with `auth: "sandbox_secret"|"sandbox_public"` and are
+  blocked without a key. **No step uses the seam yet** — the front-end rework Patrick has
+  started will add the sandbox-side actions that do.
 - **Every capture is saved** to `clone-runs/capture-<stamp>-<client>.json` (gitignored);
   every journal header carries `plan_flags` / `plan_skipped`. Diagnose from those files
   first — never from memory.

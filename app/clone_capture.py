@@ -457,15 +457,38 @@ class Reader:
 
 # ---------------------------------------------------------------- capture
 
-def capture(base, token, client_id, only_entity=None):
+def scope_entities(ents, only_entity=None, only_entities=None):
+    """Restrict a client's entity list to the requested scope.
+
+    Returns (kept, missing): the entities to capture, in CAT's order, and any requested
+    id CAT did not return. `missing` is never silently dropped by the caller — a clone of
+    two entities when three were ticked is exactly the kind of quiet partial result this
+    tool refuses to produce. An empty scope means every entity.
+    """
+    wanted = [x.strip() for x in (only_entities or []) if isinstance(x, str) and x.strip()]
+    if only_entity and only_entity not in wanted:
+        wanted.append(only_entity)
+    if not wanted:
+        return list(ents), []
+    wanted_set = set(wanted)
+    kept = [e for e in ents if e.get("id") in wanted_set]
+    found = {e.get("id") for e in kept}
+    return kept, [w for w in wanted if w not in found]
+
+
+def capture(base, token, client_id, only_entity=None, only_entities=None):
     """Read the source configuration. Returns a raw capture dict.
 
-    only_entity: restrict the capture (and therefore the plan) to a single ent_* id.
+    only_entities: restrict the capture (and therefore the plan) to these ent_* ids — the
+    entities ticked on the page. only_entity is the older single-id form and still works.
     Useful for a first live run — same information, much smaller blast radius, and it
-    matters because most of what a clone creates cannot be deleted afterwards.
+    matters because most of what a clone creates cannot be deleted afterwards. Requested
+    ids CAT did not return are recorded in cap["scope_missing"] for the caller to refuse.
     """
     r = Reader(base, token)
-    cap = {"client_id": client_id, "entities": [], "only_entity": only_entity}
+    cap = {"client_id": client_id, "entities": [], "only_entity": only_entity,
+           "only_entities": sorted({*(only_entities or []), *([only_entity] if only_entity else [])}) or None,
+           "scope_missing": []}
 
     cap["client"], _ = r.get(f"/clients/{client_id}")
     # Client-level risk settings (the Fraud Detection tier). A new client comes up on
@@ -495,8 +518,7 @@ def capture(base, token, client_id, only_entity=None):
         choose_network_tokens_form(cat_nt, portal_nt)
     cap["network_tokens_cat_raw"] = cat_nt      # kept for diagnosis
     ents, _ = r.hal(f"/clients/{client_id}/entities?limit=25&skip=0", "entities")
-    if only_entity:
-        ents = [e for e in ents if e.get("id") == only_entity]
+    ents, cap["scope_missing"] = scope_entities(ents, only_entity, only_entities)
 
     for e in ents:
         eid = e.get("id")
@@ -831,8 +853,9 @@ def profile_create_body(detail, fallback_legal_codes=None, valid_currencies=None
             # Flagged, not fatal: the profile is still created, without that currency.
             warns.append(make_flag(
                 "currency_not_available",
-                f"profile {detail.get('id')}: {d['currency']} cannot be added and was "
-                f"removed from currencies — {d['reason']}",
+                f"profile '{detail.get('name') or detail.get('id')}' will still be created, "
+                f"but {d['currency']} cannot be added and is left out of its currencies — "
+                f"{d['reason']}",
                 kind="processing_profile", object_id=detail.get("id"),
                 currency=d["currency"], reason=d["reason"], action="dropped"))
 
@@ -1200,8 +1223,8 @@ def build_plan(cap, target_client_name=None):
         for d in cdropped:
             flag(make_flag(
                 "currency_not_available",
-                f"compass settings: {d['currency']} cannot be added and was removed "
-                f"from conversion_currencies — {d['reason']}",
+                f"compass settings will still be applied, but {d['currency']} cannot be "
+                f"added and is left out of conversion_currencies — {d['reason']}",
                 kind="client_compass_settings", object_id=src_cli,
                 field="conversion_currencies", currency=d["currency"],
                 reason=d["reason"], action="dropped"))
@@ -1491,9 +1514,9 @@ def build_plan(cap, target_client_name=None):
                         for d in pcd:
                             flag(make_flag(
                                 "currency_not_available",
-                                f"processor '{pr.get('name') or pr.get('id')}': "
-                                f"{d['currency']} cannot be added and was removed from "
-                                f"{f} — {d['reason']}",
+                                f"processor '{pr.get('name') or pr.get('id')}' will still "
+                                f"be created, but {d['currency']} cannot be added and is "
+                                f"left out of {f} — {d['reason']}",
                                 kind="processor", entity=eid, object_id=pr.get("id"),
                                 field=f, currency=d["currency"], reason=d["reason"],
                                 action="dropped"))
@@ -1711,8 +1734,9 @@ def build_plan(cap, target_client_name=None):
                     for d in fdropped:
                         flag(make_flag(
                             "currency_not_available",
-                            f"{kind} '{rule_label(rule)}': {d['currency']} cannot be "
-                            f"added and was removed from {f} — {d['reason']}",
+                            f"{kind} '{rule_label(rule)}' will still be created, but "
+                            f"{d['currency']} cannot be added and is left out of {f} — "
+                            f"{d['reason']}",
                             kind=kind, entity=eid, object_id=rule.get("id"),
                             field=f, currency=d["currency"], reason=d["reason"],
                             action="dropped"))
@@ -1889,16 +1913,9 @@ def build_plan(cap, target_client_name=None):
                                       "and unreadable on the source"})
             flag(make_flag(
                 "network_tokens_manual",
-                f"NETWORK TOKENS MUST BE CONFIGURED MANUALLY on the clone (NT portal). "
-                f"Source has: NT allowed={to_replicate['nt_state']}, default billed "
-                f"entity '{to_replicate['default_billed_entity']}', provisioning="
-                f"{to_replicate['provisioning_state']}, mode="
-                f"{to_replicate['default_provision_mode']}, onboard Visa="
-                f"{to_replicate['onboard_visa']}, Mastercard="
-                f"{to_replicate['onboard_mastercard']}. Before enabling: VAS pricing "
-                f"(NT Provisioning + Update fees) on every entity; the business "
-                f"identifier (identification_value) and webpage URL are not readable "
-                f"from the source and must be supplied.",
+                # The source's settings travel on the flag as source_configuration; the
+                # message itself is the one-line instruction Patrick asked for.
+                "NETWORK TOKEN SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION STORE",
                 kind="client_network_tokens", object_id=src_cli,
                 default_entity_id=default_eid, source_configuration=to_replicate,
                 source=cap.get("network_tokens_source"), action="not_created"))

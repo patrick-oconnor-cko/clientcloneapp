@@ -3,11 +3,13 @@
 Sandbox CAT client clone — local front end for the clone tool.
 
 Run:  python3 app/server.py            (serves http://localhost:8788)
-Then open the URL, paste Client ID + CAT API key, and work through the stages:
+Then open the URL, paste Client ID + CAT API key (and, optionally, the Sandbox Secret /
+Public Keys for steps that call the Checkout sandbox API), and work through the stages:
 Load entities -> Capture -> review plan -> Dry run -> Apply -> Verify -> Clean up.
 
 Nothing is persisted except run journals under clone-runs/: credentials live only
-for the duration of the request.
+for the duration of the request. Sandbox keys are refused unless they carry the
+sk_sbox_ / pk_sbox_ prefix — a production key never gets past the handler.
 
 THIS APPLICATION WRITES. Every path defaults to not writing, and a live run needs
 dry_run=false AND confirm=="CLONE" AND a token. CAT offers no rollback, so read the
@@ -25,15 +27,49 @@ CAT_BASE = "https://client-admin.cko-sbox.ckotech.co/api"
 # real created-object ids from a write run.
 RUNS_DIR = HERE.parent / "clone-runs"
 
+# The optional Checkout sandbox API keys, typed into the page each session alongside the
+# CAT token: (request field, clone_apply auth mode, required prefix, label on the page).
+SANDBOX_KEY_FIELDS = (("sandbox_sk", "sandbox_secret", "sk_sbox_", "Sandbox Secret Key"),
+                      ("sandbox_pk", "sandbox_public", "pk_sbox_", "Sandbox Public Key"))
+
+
+def sandbox_keys(payload):
+    """Return ({auth_mode: key}, error) from the optional sandbox key fields.
+
+    This is a SANDBOX tool. A supplied key that does not carry the sandbox prefix — a
+    production sk_/pk_ above all — is refused outright on every route, before anything
+    else happens, rather than passed anywhere. Absent keys are simply absent: they are
+    only needed by steps that call the sandbox API. Keys live for the request only.
+    """
+    keys = {}
+    for field, mode, prefix, label in SANDBOX_KEY_FIELDS:
+        val = (payload.get(field) or "").strip()
+        if not val:
+            continue
+        if not val.startswith(prefix):
+            return None, f"{label} must be a sandbox key starting with {prefix} — refused"
+        keys[mode] = val
+    return keys, None
+
 
 def clone_capture_handler(payload):
     """Read-only: reads the source client and returns an ordered clone plan."""
+    keys, kerr = sandbox_keys(payload)
+    if kerr:
+        return {"error": kerr}
     client_id = (payload.get("client_id") or "").strip()
     token     = (payload.get("cat_token") or "").strip()
     if not client_id or not token:
         return {"error": "client_id and cat_token are required"}
+    # Scope: the entities ticked on the page (a list), or the older single-id field.
+    raw_scope = payload.get("only_entities")
+    if raw_scope is not None and not isinstance(raw_scope, list):
+        return {"error": "only_entities must be a list of entity ids"}
+    only_entities = sorted({x.strip() for x in (raw_scope or [])
+                            if isinstance(x, str) and x.strip()})
     cap  = cc.capture(CAT_BASE, token, client_id,
-                      only_entity=(payload.get("only_entity") or "").strip() or None)
+                      only_entity=(payload.get("only_entity") or "").strip() or None,
+                      only_entities=only_entities or None)
     # Persist the RAW capture, every time, before anything is derived from it. When a
     # plan skips something, the question is always "what did CAT actually return?" — and
     # until now the only answer was to ask someone to paste it. Gitignored with the
@@ -47,10 +83,17 @@ def clone_capture_handler(payload):
     except Exception as ex:  # never let bookkeeping break a capture
         cap_path = f"not saved: {type(ex).__name__}: {ex}"
     if not cap.get("entities"):
+        scope = cap.get("only_entities") or ([cap["only_entity"]] if cap.get("only_entity") else [])
         return {"error": f"No entities found for {client_id} "
-                         + (f"matching entity {cap.get('only_entity')}. "
-                            if cap.get("only_entity") else "")
+                         + (f"matching the selected entities {', '.join(scope)}. " if scope else "")
                          + "(check the ids and that the token is valid/unexpired)."}
+    if cap.get("scope_missing"):
+        # Refuse, don't guess: a plan for fewer entities than were ticked would apply
+        # cleanly and leave the operator believing the clone is complete.
+        return {"error": f"{len(cap['scope_missing'])} selected entity(ies) were not returned "
+                         f"by CAT for {client_id}: {', '.join(cap['scope_missing'])}. "
+                         f"Reload the entity list and tick again. Nothing was planned.",
+                "capture_path": str(cap_path)}
     plan = cc.build_plan(cap, (payload.get("new_client_name") or "").strip() or None)
     return {"plan": plan, "problems": cc.validate_plan(plan),
             "calls": cap.get("_meta", {}).get("calls"),
@@ -69,11 +112,15 @@ def clone_apply_handler(payload):
     plan = payload.get("plan")
     if not isinstance(plan, dict) or not plan.get("steps"):
         return {"error": "a plan with steps is required"}
+    keys, kerr = sandbox_keys(payload)
+    if kerr:
+        return {"error": kerr}
 
     live = payload.get("dry_run") is False
     if not live:
         run = capp.apply_plan(plan, dry_run=True,
-                             manual_values=payload.get("manual_values") or {})
+                             manual_values=payload.get("manual_values") or {},
+                             sandbox_keys=keys)
         return {"run": run, "summary": capp.render_run(run)}
 
     # ---- live write path ----
@@ -92,12 +139,15 @@ def clone_apply_handler(payload):
     run = capp.apply_plan(plan, base=CAT_BASE, token=token, dry_run=False,
                           stop_on_error=True, pace_seconds=0.35,
                           manual_values=payload.get("manual_values") or {},
-                          journal_path=str(jpath))
+                          journal_path=str(jpath), sandbox_keys=keys)
     return {"run": run, "summary": capp.render_run(run), "journal_path": str(jpath)}
 
 
 def clone_entities_handler(payload):
     """List a client's entities so the UI can offer a scope picker. Read-only, 1 GET."""
+    _, kerr = sandbox_keys(payload)
+    if kerr:
+        return {"error": kerr}
     client_id = (payload.get("client_id") or "").strip()
     token     = (payload.get("cat_token") or "").strip()
     if not client_id or not token:
@@ -113,6 +163,9 @@ def clone_entities_handler(payload):
 
 def clone_verify_handler(payload):
     """Read back created objects from CAT. GETs only — proves what actually exists."""
+    _, kerr = sandbox_keys(payload)
+    if kerr:
+        return {"error": kerr}
     objs = payload.get("created_objects")
     token = (payload.get("cat_token") or "").strip()
     if not isinstance(objs, list) or not objs:
@@ -127,6 +180,9 @@ def clone_cleanup_handler(payload):
 
     Same gating as apply: live requires dry_run false + confirm CLEANUP + a token.
     """
+    _, kerr = sandbox_keys(payload)
+    if kerr:
+        return {"error": kerr}
     objs = payload.get("created_objects")
     if not isinstance(objs, list) or not objs:
         return {"error": "created_objects is required (from a run journal)"}
@@ -147,6 +203,34 @@ def clone_cleanup_handler(payload):
             "journal_path": str(jpath)}
 
 
+# Prefill for the page, so the operator does not retype the same values every session:
+#   dev-creds.json        tracked — holds ONLY the sandbox source client id
+#   dev-creds.local.json  gitignored — the operator's own sandbox keys (sandbox_sk /
+#                         sandbox_pk), cached at their request. Never committed.
+# The CAT token is deliberately NOT cached: it is a short-lived Okta bearer and is pasted
+# every session. Whatever is injected reaches the browser, so a key without the sandbox
+# prefix is dropped here — the page must never be pre-filled with a production key.
+DEV_CREDS_FILES = (HERE / "dev-creds.json", HERE / "dev-creds.local.json")
+
+
+def dev_creds(files=DEV_CREDS_FILES):
+    """Merge the prefill files (later wins). Missing or unreadable files contribute nothing."""
+    creds = {}
+    for f in files:
+        try:
+            if pathlib.Path(f).exists():
+                data = json.loads(pathlib.Path(f).read_text())
+                if isinstance(data, dict):
+                    creds.update(data)
+        except Exception:
+            pass
+    for field, _, prefix, _ in SANDBOX_KEY_FIELDS:
+        val = creds.get(field)
+        if val is not None and not (isinstance(val, str) and val.startswith(prefix)):
+            creds.pop(field, None)     # not a sandbox key: never reaches the page
+    return creds
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json"):
         b = body.encode("utf-8") if isinstance(body, str) else body
@@ -159,16 +243,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _page(self, name):
         """Serve a tracked HTML page, injecting local dev creds for prefill."""
         html = (HERE/name).read_text()
-        # Inject prefill creds from a local file (if present) so they never live in
-        # the tracked HTML. Missing file -> fields start empty.
-        creds_file = HERE/"dev-creds.json"
-        if creds_file.exists():
-            try:
-                creds = json.loads(creds_file.read_text())
-                tag = "<script>window.__DEV_CREDS__=" + json.dumps(creds) + ";</script>"
-                html = html.replace("</head>", tag + "</head>", 1)
-            except Exception:
-                pass
+        creds = dev_creds()
+        if creds:
+            tag = "<script>window.__DEV_CREDS__=" + json.dumps(creds) + ";</script>"
+            html = html.replace("</head>", tag + "</head>", 1)
         self._send(200, html, "text/html; charset=utf-8")
 
     def do_GET(self):

@@ -25,14 +25,19 @@ python3 app/server.py     # http://localhost:8788
 |---|---|
 | Client ID | prefills from `app/dev-creds.json` — this is the **source** client |
 | **CAT API bearer token** | **paste this** — short-lived Okta token, expires in ~1h |
+| Sandbox Secret Key | optional, typed each session — `sk_sbox_…`; used only by steps that call the Checkout sandbox API |
+| Sandbox Public Key | optional, typed each session — `pk_sbox_…`; same, for endpoints that take a public key |
 
 The page is the pipeline as gates:
 
 **Load entities → Capture source config → review plan (downloadable JSON) → Dry run →
 Apply → Verify → Clean up**
 
-Scope a first run to one entity with the entity picker. Same information, much smaller blast
-radius — and that matters, because most of what a clone creates cannot be deleted afterwards.
+After **Load entities**, tick the entities you want cloned (all are ticked by default; "all"
+and "none" shortcuts sit above the list). Scope a first run to one entity. Same information,
+much smaller blast radius — and that matters, because most of what a clone creates cannot be
+deleted afterwards. A ticked entity that CAT does not return refuses the capture outright
+rather than quietly planning a smaller clone.
 
 Cloning one entity of the reference client produces **33 steps** and runs in under a minute.
 
@@ -372,8 +377,21 @@ else (the front end uses only `client_id` and `cat_token`). It used to carry a s
 `pk`/`sk` pair that nothing read; GitHub push protection flagged it, so it was removed. Note
 that `server.py` injects the *whole file* into the page as `window.__DEV_CREDS__`, so
 anything added to it reaches the browser — never put API keys or a CAT bearer token in it;
-the token is short-lived and always pasted at run time. If you want extra local prefill
-values, put them in `app/dev-creds.local.json` (gitignored; not read by the app today).
+the token is short-lived and always pasted at run time. Your own sandbox keys can be cached
+in `app/dev-creds.local.json` (gitignored, mode 600) as `sandbox_sk` / `sandbox_pk`;
+`server.dev_creds` merges it over the tracked file to prefill the two key boxes, and drops
+any value without the `sk_sbox_` / `pk_sbox_` prefix so a production key can never be
+pre-filled. The CAT token is never cached.
+
+**Sandbox API keys** (`Sandbox Secret Key` / `Sandbox Public Key` on the side panel) are
+manual, optional and per-session. The page sends them with every request alongside the
+CAT token; `server.sandbox_keys` refuses anything not prefixed `sk_sbox_` / `pk_sbox_` on
+every route, so a production key never gets past the handler. Inside `clone_apply`, a step
+opts in with `auth: "sandbox_secret"` (or `"sandbox_public"`) and is then sent with that key
+against `api.sandbox.checkout.com` instead of the CAT token; a sandbox step with no key is
+**blocked**, never sent with the CAT token, and a dry run shows that block. No plan step
+uses this yet — it is the seam for the sandbox-side actions to come. The journal header
+records *which* keys were supplied, never their values.
 
 `clone-runs/` is gitignored: journals contain real created-object ids from write runs, and
 saved captures contain a real client's full configuration — addresses, emails, bank details.
