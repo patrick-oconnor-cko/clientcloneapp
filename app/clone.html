@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Clone client — Sandbox CAT</title>
+<!-- Self-contained by design: no external CSS/JS. -->
+<style>
+  :root{--bg:#0f1115;--panel:#171a21;--panel2:#1d222b;--edge:#2a303c;--fg:#e6e9ef;--mut:#93a0b4;--accent:#4f8cff;--ok:#3fb950;--warn:#d29922;--err:#f85149}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif}
+  header{padding:16px 24px;border-bottom:1px solid var(--edge);display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  header h1{margin:0;font-size:16px;letter-spacing:.2px} header .sub{color:var(--mut);font-size:12px}
+  a{color:var(--accent);text-decoration:none;font-size:12px} a:hover{text-decoration:underline}
+  .env{margin-left:auto;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.6px;background:#2f7d4f;color:#fff}
+  .wrap{display:grid;grid-template-columns:330px 1fr;min-height:calc(100vh - 58px)}
+  .side{padding:18px;border-right:1px solid var(--edge);background:var(--panel)}
+  label{display:block;margin:14px 0 4px;font-size:12px;color:var(--mut)}
+  input{width:100%;padding:9px 10px;background:#0d0f14;border:1px solid var(--edge);border-radius:7px;color:var(--fg);font:12px ui-monospace,Menlo,monospace}
+  input:focus{outline:none;border-color:var(--accent)}
+  .btn{margin-top:16px;width:100%;padding:10px;background:var(--accent);border:0;border-radius:7px;color:#fff;font-weight:600;cursor:pointer}
+  .btn.danger{background:var(--err)}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .hint{margin-top:10px;color:var(--mut);font-size:11px}
+  .main{padding:16px 22px;overflow:auto}
+  h2{font-size:15px;margin:2px 0 12px} h3{font-size:13px;color:var(--mut);margin:18px 0 6px;text-transform:uppercase;letter-spacing:.5px}
+  table{border-collapse:collapse;width:100%;margin:6px 0 14px;font-size:12.5px}
+  th,td{border:1px solid var(--edge);padding:6px 9px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:var(--mut);font-weight:600}
+  .pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;border:1px solid var(--edge);margin:0 4px 4px 0}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)} .mut{color:var(--mut)}
+  pre{background:var(--panel);border:1px solid var(--edge);border-radius:9px;padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,Menlo,monospace;max-height:420px}
+  .toolbar{display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+  .toolbar button{padding:6px 12px;border:1px solid var(--edge);border-radius:7px;background:var(--panel2);color:var(--fg);cursor:pointer;font-size:12px}
+  .toolbar button:disabled{opacity:.4;cursor:not-allowed}
+  code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
+  /* staged flow */
+  .stages{display:flex;gap:8px;margin:6px 0 18px;flex-wrap:wrap}
+  .stage{flex:1;min-width:180px;padding:10px 12px;border:1px solid var(--edge);border-radius:9px;background:var(--panel)}
+  .stage .n{font-size:11px;color:var(--mut);letter-spacing:.5px;text-transform:uppercase}
+  .stage .t{font-weight:600;margin:2px 0 4px}
+  .stage .s{font-size:11.5px;color:var(--mut)}
+  .stage.active{border-color:var(--accent)} .stage.done{border-color:#265b34}
+  .banner{border:1px solid #5b4a20;background:#221d10;color:#e8d9a8;border-radius:9px;padding:11px 13px;font-size:12.5px;margin-bottom:14px}
+  .banner.stop{border-color:#5b2626;background:#211010;color:#f0b4b0}
+  .confirm{border:1px solid var(--err);border-radius:9px;padding:12px;margin:10px 0;background:#1a1113}
+  .confirm input[type=text]{margin-top:8px}
+  .rowbtn{padding:4px 10px;border-radius:6px;border:1px solid var(--edge);cursor:pointer;
+          font-size:11.5px;background:var(--panel2);color:var(--fg);white-space:nowrap}
+  .rowbtn.del{border-color:#7a2b28;color:#ff9d97} .rowbtn.del:hover{background:#3a1614}
+  .rowbtn.deact{border-color:#6b5520;color:#e8c368} .rowbtn.deact:hover{background:#33290f}
+</style>
+</head>
+<body>
+<header>
+  <h1>Clone client</h1>
+  <span class="sub">copy an entire client configuration to a new client</span>
+  <span class="env" id="env">SANDBOX</span>
+</header>
+<div class="wrap">
+  <div class="side">
+    <label>Source Client ID (CLI to clone)</label>
+    <input id="src_client" placeholder="cli_..." autocomplete="off"/>
+    <label>CAT API key (Bearer token)</label>
+    <input id="cat_token" placeholder="eyJ... (Okta bearer)" autocomplete="off"/>
+    <label>New client name</label>
+    <input id="new_name" placeholder="e.g. PTOC Sandbox (clone)" autocomplete="off"/>
+
+    <label>Scope — which entities to clone</label>
+    <button class="btn" id="loadents" style="margin-top:4px">Load entities</button>
+    <div id="entpick" class="hint"></div>
+
+    <button class="btn" id="capture">Capture source config</button>
+    <div class="hint">Read-only. Reads the source client and builds a clone plan.
+      Nothing is created at this step.</div>
+    <div class="hint" id="status"></div>
+  </div>
+
+  <div class="main">
+    <div class="stages" id="stages"></div>
+    <div id="view">
+      <div class="banner">
+        <b>This is the only part of the app that writes.</b> Everything else performs
+        read-only <code>GET</code>s. Capture and plan are safe; <b>Apply</b> creates real
+        objects in the target tenant and cannot be rolled back via the API.
+      </div>
+      <h2>How it works</h2>
+      <table>
+        <tr><th>Stage</th><th>What happens</th><th>Writes?</th></tr>
+        <tr><td><b>1. Capture</b></td><td>Reads the source client's full configuration via CAT <code>GET</code>s.</td><td class="ok">no</td></tr>
+        <tr><td><b>2. Plan</b></td><td>Produces an ordered, inspectable JSON plan of every call needed to rebuild it. Downloadable.</td><td class="ok">no</td></tr>
+        <tr><td><b>3. Dry run</b></td><td>Resolves every id placeholder and prints the exact calls that would be sent. No sockets opened.</td><td class="ok">no</td></tr>
+        <tr><td><b>4. Apply</b></td><td>Executes the plan, remapping every id as it goes, journalling each call to <code>clone-runs/</code>.</td><td class="err">YES</td></tr>
+        <tr><td><b>5. Clean up</b></td><td>Reverses the run as far as CAT allows — deletes what can be deleted, sets the rest Inactive. <b>Partial:</b> channels and processors can be neither deleted nor deactivated.</td><td class="err">YES</td></tr>
+      </table>
+      <p class="mut">Capture shows exactly how much of a run would be reversible before you commit to it.</p>
+      <p class="mut">Enter a source Client ID and token, then Capture.</p>
+    </div>
+  </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const API_BASE=(location.origin&&location.origin.startsWith("http"))?location.origin:"http://localhost:8787";
+let PLAN=null, OUTLOOK=null, STAGE=0;   // 0 none · 1 captured · 2 planned · 3 applied
+
+function fmtDur(ms){const s=ms/1000;
+  if(s<10)return s.toFixed(1)+"s"; if(s<60)return Math.round(s)+"s";
+  const m=Math.floor(s/60),r=Math.round(s%60); return r?`${m}m ${r}s`:`${m}m`;}
+
+const STAGES=[["Capture","read source config"],["Plan","ordered call list"],["Apply","create in target"]];
+function drawStages(){
+  $("stages").innerHTML=STAGES.map((s,i)=>{
+    const n=i+1, cls=STAGE>n-1?"done":(STAGE===n-1?"active":"");
+    const mark=STAGE>n-1?'<span class="ok">✓ done</span>':(STAGE===n-1?'<span class="warn">next</span>':'<span class="mut">waiting</span>');
+    return `<div class="stage ${cls}"><div class="n">Stage ${n}</div><div class="t">${s[0]}</div>
+            <div class="s">${s[1]} · ${mark}</div></div>`;}).join("");
+}
+
+async function post(path,body){
+  const r=await fetch(API_BASE+path,{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)});
+  return {code:r.status, body:await r.json()};
+}
+
+// ---- scope picker: which entities the clone covers ----
+let SCOPE="";   // "" = all entities, otherwise a single ent_ id
+async function loadEntities(){
+  const cid=$("src_client").value.trim(), tok=$("cat_token").value.trim();
+  if(!cid||!tok){ $("entpick").innerHTML='<span class="err">Client ID and token first</span>'; return; }
+  $("loadents").disabled=true; $("entpick").textContent="Loading…";
+  try{
+    const {body:j}=await post("/api/clone/entities",{client_id:cid,cat_token:tok});
+    if(j.error){ $("entpick").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return; }
+    $("entpick").innerHTML=
+      `<label style="margin:8px 0 2px"><input type="radio" name="scope" value="" checked/>
+         All entities <span class="mut">(${j.entities.length})</span></label>`+
+      j.entities.map(e=>`<label style="margin:2px 0"><input type="radio" name="scope" value="${esc(e.id)}"/>
+         ${esc(e.name||e.id)} <span class="mut">${esc(e.region||"")} · ${esc(e.status||"")}</span><br>
+         <code style="font-size:10px">${esc(e.id)}</code></label>`).join("")+
+      `<div class="mut" style="margin-top:6px">A single entity means a much smaller first run —
+         and most of what a clone creates cannot be deleted afterwards.</div>`;
+    $("entpick").querySelectorAll('input[name=scope]').forEach(r=>{
+      r.onchange=()=>{SCOPE=r.value;};});
+  } finally { $("loadents").disabled=false; }
+}
+
+async function capture(){
+  const body={client_id:$("src_client").value.trim(),cat_token:$("cat_token").value.trim(),
+              new_client_name:$("new_name").value.trim(),only_entity:SCOPE};
+  if(!body.client_id||!body.cat_token){
+    $("status").innerHTML='<span class="err">Source Client ID and token are required</span>'; return;}
+  $("capture").disabled=true;
+  $("status").textContent="Reading source configuration…"; $("status").className="hint";
+  const t0=performance.now();
+  try{
+    const {code,body:j}=await post("/api/clone/capture",body);
+    const el=fmtDur(performance.now()-t0);
+    if(code===501){ notImplemented(j,el); return; }
+    if(j.error){ $("status").innerHTML='<span class="err">'+esc(j.error)+'</span> <span class="mut">— after '+el+'</span>'; return; }
+    PLAN=j.plan||null; OUTLOOK=j.cleanup_outlook||null; STAGE=2; drawStages(); renderPlan(j,el);
+    $("status").innerHTML='<span class="ok">Captured</span> <span class="mut">· '+el+'</span>';
+  }catch(e){ $("status").innerHTML='<span class="err">'+esc(e)+'</span>'; }
+  finally{ $("capture").disabled=false; }
+}
+
+function notImplemented(j,el){
+  STAGE=0; drawStages();
+  $("status").innerHTML='<span class="warn">Backend not built yet</span> <span class="mut">· '+el+'</span>';
+  $("view").innerHTML=`<div class="banner stop"><b>Clone engine not implemented.</b><br>
+    Stage <code>${esc(j.stage||"?")}</code> — ${esc(j.detail||"")}</div>
+    <h2>Front end is ready</h2>
+    <p class="mut">The page, routing and staged flow all work. What's missing is the engine:
+    the CAT write-endpoint list and the ordering sequence.</p>
+    <h3>Still to be decided</h3>
+    <table>
+      <tr><th>Question</th><th>Why it matters</th></tr>
+      <tr><td>Target: new client, or an existing empty one?</td><td>Changes whether stage 3 starts with a client-create call.</td></tr>
+      <tr><td>What is <i>not</i> clonable by API?</td><td>Acquirer MIDs, BINs, CAICs, scheme enablement and pricing are CKO-provisioned; the plan must mark these as skipped rather than fail on them.</td></tr>
+      <tr><td>Behaviour on partial failure</td><td>A failure at call 47 of 120 leaves a half-built client. The journal needs to support resume or cleanup.</td></tr>
+    </table>`;
+}
+
+// ---- human-readable review of everything the plan will create ----
+const KINDLABEL={entity:"Entity",currency_account:"Currency account",
+  processing_profile:"Processing profile",processing_channel:"Processing channel",
+  processor:"Processor",sessions_channel:"Sessions layer",
+  payment_routing_rule:"Payment routing rule",payout_routing_rule:"Payout routing rule",
+  payout_setting:"Payout instruction",payout_route:"Payout route",client:"Client"};
+
+function chip(t,cls){return `<span class="pill ${cls||''}">${esc(t)}</span>`;}
+
+// per-kind one-line detail, pulled from the resolved body
+function detailOf(s){
+  const b=s.body||{}, d=[];
+  const push=(k,v)=>{if(v!==undefined&&v!==null&&v!=="")d.push(`${k} <b>${esc(v)}</b>`);};
+  switch(s.kind){
+    case "entity":
+      push("incorporated",(b.principal_business_address||{}).country_iso3_code);
+      push("tz",b.timezone); push("legal entity",(b.cko_legal_entities||[]).join(", "));
+      break;
+    case "currency_account": push("currency",b.holding_currency); break;
+    case "processing_profile":
+      push("type",b.processing_type); push("schemes",(b.schemes||[]).join(", "));
+      push("acquirer",b.acquirer_key); push("BIN",b.acquiring_bin);
+      const mccs=(b.business_settings||[]).map(x=>x.merchant_category_code).filter(Boolean);
+      if(mccs.length)push("MCC",mccs.join(", "));
+      push("FT",(b.custom_settings||{}).funds_transfer_type);
+      break;
+    case "processing_channel":
+      push("services",(b.services||[]).join(", ")); push("model",(b.business_model_type||{}).name||b.business_model_type);
+      break;
+    case "processor":
+      push("scheme",b.scheme); push("MCC",b.merchant_category_code);
+      push("acquirer",b.acquirer_id);
+      d.push(b.profile_id?`bound to <b>profile</b>`:`<b>direct</b> (inline acquirer settings)`);
+      break;
+    case "payment_routing_rule": {
+      const anys=Object.keys(b).filter(k=>k.startsWith("allow_any_")&&b[k]);
+      d.push(anys.length===8?"<b>unrestricted</b> (matches everything)":`${anys.length}/8 conditions unrestricted`);
+      push("revenue →",b.revenue_currency_account_id?"currency account":null);
+      break; }
+    case "payout_routing_rule": push("source",b.source_identifier?"currency account":null); break;
+    case "payout_setting":
+      push("schedule",(b.payout_schedule||{}).cron_schedule);
+      push("instrument",(b.payment_instrument||{}).instrument_type);
+      break;
+    case "payout_route": push("corridor",`${b.country_iso3_code||"?"} / ${b.currency_code||"?"}`); break;
+  }
+  return d.join(" · ");
+}
+
+// ---- "if this goes wrong, what can I undo?" — shown BEFORE applying ----
+// Driven entirely by the server's cleanup_outlook, which reads the same REMOVAL map the
+// cleanup engine uses, so this cannot drift from what cleanup actually does.
+function renderOutlook(o,total){
+  if(!o) return "";
+  const c=o.counts, pct=total?Math.round(100*c.permanent/total):0;
+  const rows=(obj,cls)=>Object.entries(obj||{})
+    .map(([k,n])=>`<tr><td>${esc(KINDLABEL[k]||k)}</td><td>${n}</td>
+      <td class="${cls}">${cls==='err'?'permanent':(cls==='warn'?'set Inactive':'deleted')}</td>
+      <td class="mut">${esc((o.permanent_reasons||{})[k]||'')}</td></tr>`).join("");
+  return `<h3>If you need to undo this</h3>
+    <div class="banner${c.permanent?' stop':''}">
+      Cleanup can reverse <b>${c.deletable+c.deactivatable} of ${total}</b> objects.
+      <b class="err">${c.permanent} cannot be undone at all (${pct}%)</b> — CAT has no
+      delete and no status endpoint for them, so they stay in the sandbox for good.
+      Nothing is ever truly deleted except the ${c.deletable} below: clients, entities and
+      profiles can only be set <b>Inactive</b>.
+    </div>
+    <table><tr><th>Object</th><th>Count</th><th>Cleanup can</th><th>Why not</th></tr>
+      ${rows(o.deletable,'ok')}${rows(o.deactivatable,'warn')}${rows(o.permanent,'err')}
+    </table>
+    <p class="mut">Cleanup runs after an apply — a <b>Clean up this run</b> button appears
+      with the results, previews what it would do, and needs a separate confirmation.</p>`;
+}
+
+function renderPlan(j,el){
+  const steps=(PLAN&&PLAN.steps)||[];
+  const ents=[...new Set(steps.filter(s=>s.entity).map(s=>s.entity))];
+  const bySeq=s=>s.seq;
+
+  // group: entity -> kind -> steps ; processors nest under their channel
+  let tree="";
+  const clientStep=steps.find(s=>s.kind==="client");
+  if(clientStep){
+    tree+=`<h3>Client</h3><table><tr><th>#</th><th>Will create</th><th>Detail</th></tr>
+      <tr><td>${clientStep.seq}</td><td><b>${esc(clientStep.body.name||"—")}</b></td>
+      <td class="mut">new top-level client</td></tr></table>`;
+  }
+  ents.forEach(eid=>{
+    const mine=steps.filter(s=>s.entity===eid);
+    const entStep=mine.find(s=>s.kind==="entity");
+    tree+=`<h3>${esc((entStep&&entStep.label)||eid)} <span class="mut">${esc(eid)}</span></h3>`;
+    if(entStep) tree+=`<p class="mut">${detailOf(entStep)}</p>`;
+    const order=["currency_account","processing_profile","processing_channel",
+                 "payment_routing_rule","payout_routing_rule","payout_setting","payout_route"];
+    order.forEach(kind=>{
+      let rows=mine.filter(s=>s.kind===kind).sort((a,b)=>bySeq(a)-bySeq(b));
+      if(!rows.length) return;
+      tree+=`<div style="margin:10px 0 2px"><b>${esc(KINDLABEL[kind])}</b>
+             <span class="mut">— ${rows.length}</span></div><table>
+             <tr><th style="width:44px">#</th><th>Name</th><th>Detail</th><th>Notes</th></tr>`;
+      rows.forEach(s=>{
+        tree+=`<tr><td>${s.seq}</td><td><b>${esc(s.label||"—")}</b></td>
+               <td class="mut">${detailOf(s)}</td>
+               <td class="mut">${(s.notes||[]).map(n=>esc(n)).join("<br>")||""}</td></tr>`;
+        // nest this channel's processors and sessions layer
+        if(kind==="processing_channel"){
+          mine.filter(x=>x.parent===s.provides).sort((a,b)=>bySeq(a)-bySeq(b)).forEach(x=>{
+            tree+=`<tr><td>${x.seq}</td>
+              <td style="padding-left:22px">↳ ${esc(KINDLABEL[x.kind]||x.kind)}: ${esc(x.label||"")}</td>
+              <td class="mut">${detailOf(x)}</td>
+              <td class="mut">${(x.notes||[]).map(n=>esc(n)).join("<br>")||""}</td></tr>`;
+          });
+        }
+      });
+      tree+=`</table>`;
+    });
+  });
+
+  const skipped=(PLAN.skipped||[]), warns=(PLAN.warnings||[]);
+  $("view").innerHTML=`
+    <div class="banner">Plan built from the source config. <b>Nothing has been created.</b>
+      Everything below is what <i>would</i> be created, in order.</div>
+    <h2>${esc(PLAN.target.client_name||"Clone")}
+      <span class="mut">— ${steps.length} calls · ${ents.length} entities · from
+      ${esc(PLAN.source.client_name||PLAN.source.client_id)}</span></h2>
+    <p class="mut">Scope: <b>${SCOPE?esc(SCOPE):"all entities"}</b></p>
+    ${warns.length?`<div class="banner"><b>${warns.length} warning(s)</b><br>`+
+        warns.map(esc).join("<br>")+`</div>`:''}
+    ${tree}
+    <h3>Will NOT be created <span class="mut">— ${skipped.length}</span></h3>
+    <table><tr><th>Item</th><th>Why</th></tr>
+      ${skipped.map(s=>`<tr><td>${esc(s.kind)}${s.entity?' <span class="mut">'+esc(s.entity)+'</span>':''}</td>
+        <td class="mut">${esc(s.reason)}</td></tr>`).join("")}</table>
+    <div class="toolbar">
+      <button onclick="dlPlan()">Download plan (.json)</button>
+      <button onclick="copyPlan()">Copy plan</button>
+    </div>
+    <details><summary class="mut" style="cursor:pointer;margin:8px 0">Raw plan JSON</summary>
+      <pre id="plantext">${esc(JSON.stringify(PLAN,null,2))}</pre></details>
+    <h3>Stage 3 — Dry run <span class="mut">(safe)</span></h3>
+    <p class="mut">Resolves every id placeholder against a synthetic id map and prints the
+      exact calls that <i>would</i> be sent. No sockets are opened, nothing is created.</p>
+    <div class="toolbar"><button onclick="dryRun()">Dry run — resolve all ${steps.length} calls</button></div>
+    <div id="runview"></div>
+    ${renderOutlook(OUTLOOK,steps.length)}
+    <div class="confirm">
+      <b class="err">Stage 4 — Live apply.</b> Sends ${steps.length} POSTs and creates real
+      objects in <b>sandbox</b>. If a step fails the run stops there; everything created
+      before it remains. Each run is journalled to <code>clone-runs/</code>.
+      ${warns.length?`<br><span class="warn">${warns.length} warning(s) above — review first.</span>`:''}
+      ${skipped.length?`<br><span class="mut">${skipped.length} item(s) will not be created.</span>`:''}
+      <input type="text" id="confirmbox" placeholder="type CLONE to enable" autocomplete="off"/>
+      <button class="btn danger" id="applybtn" disabled onclick="apply()">Apply plan — create ${steps.length} objects</button>
+    </div>`;
+  const cb=$("confirmbox");
+  cb.oninput=()=>{$("applybtn").disabled=cb.value.trim()!=="CLONE";};
+}
+
+async function dryRun(){
+  $("status").textContent="Resolving…";
+  const t0=performance.now();
+  const {code,body:j}=await post("/api/clone/apply",{plan:PLAN,dry_run:true});
+  const el=fmtDur(performance.now()-t0);
+  if(j.error){ $("status").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return; }
+  const r=j.run, c=r.counts;
+  const blocked=r.journal.filter(e=>e.status==="blocked").length;
+  $("status").innerHTML='<span class="ok">Dry run clean</span> <span class="mut">· '+el+'</span>';
+  $("runview").innerHTML=`
+    <div class="banner">Dry run — <b>nothing was sent</b>. ${c.created}/${c.steps} steps resolved,
+      ${blocked} blocked by unresolved ids, ${Object.keys(r.id_map).length} id-map entries.</div>
+    ${r.problems.length?`<div class="banner stop"><b>Problems</b><br>`+
+       r.problems.map(esc).join("<br>")+`</div>`:''}
+    <table><tr><th>#</th><th>Kind</th><th>Resolved call</th><th>Would create</th></tr>
+    ${r.journal.map(e=>`<tr>
+      <td>${e.seq}</td><td>${esc(e.kind)}</td>
+      <td><code>${esc(e.method)} ${esc(e.path)}</code>${e.error?'<br><span class="err">'+esc(e.error)+'</span>':''}</td>
+      <td>${e.would_create?'<code>'+esc(e.would_create)+'</code>':'<span class="mut">—</span>'}</td>
+    </tr>`).join("")}</table>
+    <div class="toolbar"><button onclick="dlRun()">Download run journal (.json)</button></div>`;
+  LASTRUN=r;
+}
+let LASTRUN=null;
+function dlRun(){if(!LASTRUN)return;
+  const b=new Blob([JSON.stringify(LASTRUN,null,2)],{type:"application/json"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(b);
+  a.download="clone-dry-run.json";a.click();}
+
+function showRun(html){
+  // Always report into a dedicated block at the TOP of the results area, then scroll to
+  // it. Writing into runview alone left the report off-screen below the plan.
+  $("runview").innerHTML=html;
+  $("runview").scrollIntoView({behavior:"smooth",block:"start"});
+}
+
+async function apply(){
+  const n=(PLAN.steps||[]).length;
+  if(!confirm(`Create ${n} real objects in the CAT sandbox?\n\n`+
+              `A failed step stops the run; everything created before it remains.`)){
+    $("status").innerHTML='<span class="mut">Apply cancelled — nothing was sent.</span>';
+    return;
+  }
+  $("applybtn").disabled=true;
+  $("status").innerHTML='<span class="warn">Applying '+n+' steps — do not close this tab…</span>';
+  showRun(`<div class="banner"><b>Applying ${n} steps…</b><br>
+    Roughly ${Math.ceil(n*0.6)}s at the paced rate. The report appears here when it finishes.
+    Every step is journalled to <code>clone-runs/</code> as it happens, so even if this tab
+    dies the record survives.</div>`);
+  const t0=performance.now();
+  let j, code;
+  try{
+    ({code,body:j}=await post("/api/clone/apply",
+      {plan:PLAN,cat_token:$("cat_token").value.trim(),dry_run:false,confirm:"CLONE",
+       manual_values:MANUAL}));
+  }catch(e){
+    // network died / non-JSON response / token expired mid-run. Objects may still have
+    // been created, so point at the journal rather than implying nothing happened.
+    $("status").innerHTML='<span class="err">Request failed</span>';
+    showRun(`<div class="banner stop"><b>The request failed: ${esc(e)}</b><br>
+      This does <b>not</b> mean nothing was created — the server may have written objects
+      before the connection broke. Check the newest file in <code>clone-runs/</code> for
+      the authoritative record.</div>`);
+    $("applybtn").disabled=false;
+    return;
+  }
+  const el=fmtDur(performance.now()-t0);
+  if(!j || j.error){
+    $("status").innerHTML='<span class="err">'+esc((j&&j.error)||"empty response")+
+                          '</span> <span class="mut">· '+el+'</span>';
+    showRun(`<div class="banner stop"><b>${esc((j&&j.error)||"Empty response from server")}</b><br>
+      ${esc((j&&j.detail)||"")}<br>HTTP ${esc(code)}. Nothing was created unless a journal
+      exists in <code>clone-runs/</code>.</div>`);
+    $("applybtn").disabled=false;
+    return;
+  }
+  const r=j.run, c=r.counts, ok=c.failed===0;
+  STAGE=3; drawStages(); LASTRUN=r;
+  $("status").innerHTML=(ok?'<span class="ok">Clone complete</span>'
+                          :'<span class="err">Stopped on failure</span>')+
+                        ' <span class="mut">· '+el+'</span>';
+  showRun(`
+    <div class="banner${ok?'':' stop'}">
+      <b>${ok?'Created all '+c.created+' objects.':'Run stopped after '+c.created+' of '+c.steps+' steps.'}</b>
+      ${c.failed?` ${c.failed} failed, ${c.not_attempted} not attempted.`:''}
+      <br>Journal: <code>${esc(j.journal_path||r.journal_path||'—')}</code>
+      ${ok?'':'<br><span class="err">No rollback. The objects below exist. Use Clean up to remove what CAT allows.</span>'}
+    </div>
+    <div class="toolbar">
+      <button onclick="cleanupPreview()">Clean up this run — preview</button>
+    </div>
+    <div id="cleanview"></div>
+    ${r.problems.length?`<div class="banner stop"><b>Problems</b><br>`+
+       r.problems.map(esc).join("<br>")+`</div>`:''}
+    <h3>Created <span class="mut">— ${(r.created_objects||[]).length}</span></h3>
+    <div class="toolbar"><button onclick="verifyRun()">Verify in CAT (read back)</button></div>
+    <div id="verifyview"><p class="mut">Read back each object from CAT to confirm what
+      actually exists, then remove or deactivate individually.</p></div>
+    <h3>Full journal</h3>
+    <table><tr><th>#</th><th>Kind</th><th>Call</th><th>Status</th></tr>
+      ${r.journal.map(e=>`<tr><td>${e.seq}</td><td>${esc(e.kind)}</td>
+        <td><code>${esc(e.method)} ${esc(e.path)}</code>
+          ${e.error?'<br><span class="err">'+esc(e.error)+'</span>':''}</td>
+        <td>${typeof e.status==='number'&&e.status<300?'<span class="ok">'+e.status+'</span>'
+             :'<span class="err">'+esc(e.status)+'</span>'}</td></tr>`).join("")}</table>
+    <div class="toolbar"><button onclick="dlRun()">Download run journal (.json)</button></div>`);
+  // leave Apply disabled on success: re-running would create a second copy
+  $("applybtn").disabled = ok;
+}
+// hand-supplied values for fields capture cannot read (see task: manual entry UI)
+const MANUAL={};
+
+// ---- verify: GET each created object back from CAT, then act per item ----
+// The POST response is what CAT *said*; this is what CAT actually holds.
+let VERIFY=null;
+const CANLABEL={delete:'<span class="ok">can delete</span>',
+                status:'<span class="warn">can set Inactive</span>',
+                none:'<span class="err">permanent</span>'};
+
+async function verifyRun(){
+  if(!LASTRUN||!(LASTRUN.created_objects||[]).length){
+    $("verifyview").innerHTML='<p class="mut">Nothing was created in this run.</p>'; return; }
+  $("verifyview").innerHTML='<p class="mut">Reading back from CAT…</p>';
+  let j;
+  try{
+    ({body:j}=await post("/api/clone/verify",
+      {created_objects:LASTRUN.created_objects,cat_token:$("cat_token").value.trim()}));
+  }catch(e){ $("verifyview").innerHTML='<span class="err">'+esc(e)+'</span>'; return; }
+  if(j.error){ $("verifyview").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return; }
+  VERIFY=j; drawVerify();
+}
+
+function drawVerify(){
+  const s=VERIFY.summary, rows=VERIFY.rows;
+  const badge=r=>r.exists===true?'<span class="ok">present</span>'
+              :r.exists===false?'<span class="mut">gone</span>'
+              :'<span class="warn">unknown</span>';
+  $("verifyview").innerHTML=`
+    <div class="banner${s.absent||s.unknown?'':''}">
+      Read back from CAT: <b>${s.present} present</b>, ${s.absent} gone,
+      ${s.unknown} unverifiable · <b>${s.removable}</b> can be removed or deactivated.
+    </div>
+    <table>
+      <tr><th style="width:30px"></th><th>#</th><th>Kind</th><th>Name in CAT</th>
+          <th>State</th><th>Undo call</th><th style="width:110px">Action</th></tr>
+      ${rows.map((r,i)=>{
+        const actionable = r.exists===true && r.can!=='none' && r.undo;
+        const btn = actionable
+          ? `<button class="rowbtn ${r.can==='delete'?'del':'deact'}" onclick="undoOne(${i})">
+               ${r.can==='delete'?'Delete':'Set Inactive'}</button>`
+          : (r.exists===false?'<span class="mut">already gone</span>'
+                             :`<span class="mut">—</span>`);
+        return `<tr id="vrow${i}">
+        <td>${actionable?`<input type="checkbox" class="pick" data-i="${i}" checked/>`:''}</td>
+        <td>${r.seq??'—'}</td><td>${esc(r.kind)}</td>
+        <td>${esc(r.name||r.label||'—')}${r.status?` <span class="mut">(${esc(r.status)})</span>`:''}
+            <br><code style="font-size:10px">${esc(r.id||'—')}</code></td>
+        <td>${badge(r)}${r.note?`<br><span class="mut">${esc(r.note)}</span>`:''}</td>
+        <td>${r.undo?`<code style="font-size:10.5px">${esc(r.undo.method)} ${esc(r.undo.path)}</code>`
+                    +(r.undo.body?`<br><span class="mut" style="font-size:10px">${esc(JSON.stringify(r.undo.body))}</span>`:'')
+                    :`<span class="mut">${esc(r.why_not||'no endpoint')}</span>`}</td>
+        <td>${btn}</td>
+      </tr>`;}).join("")}
+    </table>
+    ${s.removable?`<div class="confirm">
+      <b class="err">Remove selected.</b> Deletes are permanent; the rest are set Inactive.
+      Untick anything you want to keep. Type <code>CLEANUP</code> to enable.
+      <input type="text" id="cleanconfirm" placeholder="type CLEANUP to enable" autocomplete="off"/>
+      <button class="btn danger" id="cleanbtn" disabled onclick="cleanupSelected()">Remove selected</button>
+    </div>`:'<p class="mut">Nothing here can be removed or deactivated via the API.</p>'}
+    <div id="cleanview"></div>`;
+  const cb=$("cleanconfirm");
+  if(cb) cb.oninput=()=>{$("cleanbtn").disabled=cb.value.trim()!=="CLEANUP";};
+}
+
+// Single-object undo, straight from the row button. The confirm names the exact call,
+// which is stronger friction than a generic "type CLEANUP" for a one-item action.
+async function undoOne(i){
+  const r=VERIFY.rows[i], u=r.undo;
+  if(!u) return;
+  const obj=(LASTRUN.created_objects||[]).find(o=>o.new_id===r.id);
+  if(!obj){ alert("Could not match this row to a created object."); return; }
+  const verb = r.can==='delete' ? "DELETE (permanent)" : "set Inactive";
+  if(!confirm(`${verb}:\n\n${r.kind} — ${r.name||r.label||r.id}\n${r.id}\n\n`+
+              `${u.method} ${u.path}\n\nProceed?`)) return;
+
+  const cell=document.querySelector(`#vrow${i} td:last-child`);
+  if(cell) cell.innerHTML='<span class="mut">working…</span>';
+  let j;
+  try{
+    ({body:j}=await post("/api/clone/cleanup",
+      {created_objects:[obj],plan:PLAN,dry_run:false,confirm:"CLEANUP",
+       cat_token:$("cat_token").value.trim()}));
+  }catch(e){
+    if(cell) cell.innerHTML='<span class="err">failed</span>';
+    $("cleanview").innerHTML='<div class="banner stop">Request failed: '+esc(e)+
+      '<br>The call may still have gone through — re-verify to check.</div>'; return;
+  }
+  if(j.error){
+    if(cell) cell.innerHTML='<span class="err">refused</span>';
+    $("cleanview").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return;
+  }
+  const e0=(j.run.journal||[])[0]||{};
+  const ok=typeof e0.status==='number'&&e0.status<300;
+  if(cell) cell.innerHTML=ok?'<span class="ok">done '+e0.status+'</span>'
+                            :'<span class="err">HTTP '+esc(e0.status)+'</span>';
+  $("cleanview").innerHTML=`<div class="banner${ok?'':' stop'}">
+    <b>${esc(e0.method||u.method)} ${esc(e0.path||u.path)}</b> → ${ok?'OK':'failed'} ${esc(e0.status)}
+    ${e0.error?'<br><span class="err">'+esc(e0.error)+'</span>':''}
+    <br>Journal: <code>${esc(j.journal_path||'—')}</code></div>`;
+  if(ok) verifyRun();   // re-read from CAT so the table shows truth, not assumption
+}
+
+function selectedObjects(){
+  const picked=[...document.querySelectorAll(".pick:checked")].map(c=>+c.dataset.i);
+  const ids=new Set(picked.map(i=>VERIFY.rows[i].id));
+  return (LASTRUN.created_objects||[]).filter(o=>ids.has(o.new_id));
+}
+
+async function cleanupSelected(){
+  const objs=selectedObjects();
+  if(!objs.length){ $("cleanview").innerHTML='<p class="mut">Nothing selected.</p>'; return; }
+  if(!confirm(`Remove or deactivate ${objs.length} object(s)?\n\nDeletes cannot be undone.`)) return;
+  $("cleanbtn").disabled=true; $("status").textContent="Cleaning up…";
+  let j;
+  try{
+    ({body:j}=await post("/api/clone/cleanup",
+      {created_objects:objs,plan:PLAN,dry_run:false,confirm:"CLEANUP",
+       cat_token:$("cat_token").value.trim()}));
+  }catch(e){
+    $("cleanview").innerHTML='<div class="banner stop">Request failed: '+esc(e)+
+      '<br>Check <code>clone-runs/</code> — some removals may have gone through.</div>';
+    return;
+  }
+  if(j.error){ $("cleanview").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return; }
+  const r=j.run, c=r.counts;
+  $("status").innerHTML=(c.failed?'<span class="err">Cleanup had failures</span>'
+                                 :'<span class="ok">Cleanup done</span>');
+  $("cleanview").innerHTML=`
+    <div class="banner${c.failed?' stop':''}"><b>Removed ${c.removed} of ${c.attempted}.</b>
+      ${c.failed?c.failed+' failed. ':''}Journal: <code>${esc(j.journal_path||'—')}</code></div>
+    <table><tr><th>Kind</th><th>Name</th><th>Call</th><th>Status</th></tr>
+      ${r.journal.map(e=>`<tr><td>${esc(e.kind)}</td><td>${esc(e.label||'—')}</td>
+        <td><code>${esc(e.method)} ${esc(e.path)}</code>
+          ${e.error?'<br><span class="err">'+esc(e.error)+'</span>':''}</td>
+        <td>${typeof e.status==='number'&&e.status<300?'<span class="ok">'+e.status+'</span>'
+             :'<span class="err">'+esc(e.status)+'</span>'}</td></tr>`).join("")}</table>
+    <div class="toolbar"><button onclick="verifyRun()">Re-verify in CAT</button></div>`;
+}
+
+// ---- cleanup: remove what a run created, as far as CAT allows ----
+// Preview is a dry run (no sockets). Removal is gated on typing CLEANUP.
+async function cleanupPreview(){
+  if(!LASTRUN||!(LASTRUN.created_objects||[]).length){
+    $("cleanview").innerHTML='<p class="mut">Nothing recorded as created in this run.</p>'; return; }
+  const {body:j}=await post("/api/clone/cleanup",
+    {created_objects:LASTRUN.created_objects,plan:PLAN,dry_run:true});
+  if(j.error){ $("cleanview").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return; }
+  const r=j.run, c=r.counts;
+  $("cleanview").innerHTML=`
+    <div class="banner"><b>Cleanup preview — nothing sent.</b>
+      ${c.attempted} of ${c.attempted+c.unremovable} objects can be removed;
+      <b>${c.unremovable} cannot</b>. Reverse creation order.</div>
+    <h3>Would remove <span class="mut">— ${c.attempted}</span></h3>
+    <table><tr><th>Kind</th><th>Name</th><th>Call</th></tr>
+      ${r.journal.map(e=>`<tr><td>${esc(e.kind)}</td><td>${esc(e.label||'—')}</td>
+        <td><code>${esc(e.method)} ${esc(e.path)}</code></td></tr>`).join("")
+        ||'<tr><td colspan="3" class="mut">none</td></tr>'}</table>
+    <h3>Cannot be removed <span class="mut">— ${c.unremovable}</span></h3>
+    <table><tr><th>Kind</th><th>Name</th><th>Why</th></tr>
+      ${r.unremovable.map(u=>`<tr><td>${esc(u.kind)}</td><td>${esc(u.label||'—')}</td>
+        <td class="mut">${esc(u.why)}</td></tr>`).join("")
+        ||'<tr><td colspan="3" class="mut">none</td></tr>'}</table>
+    ${c.attempted?`<div class="confirm">
+      <b class="err">Remove ${c.attempted} object(s).</b> Deletes are permanent;
+      status changes set objects Inactive. Type <code>CLEANUP</code> to enable.
+      <input type="text" id="cleanconfirm" placeholder="type CLEANUP to enable" autocomplete="off"/>
+      <button class="btn danger" id="cleanbtn" disabled onclick="cleanupRun()">Remove now</button>
+    </div>`:''}`;
+  const cb=$("cleanconfirm");
+  if(cb) cb.oninput=()=>{$("cleanbtn").disabled=cb.value.trim()!=="CLEANUP";};
+}
+
+async function cleanupRun(){
+  if(!confirm("Remove the listed objects?\n\nDeletes are permanent. This cannot be undone.")) return;
+  $("cleanbtn").disabled=true; $("status").textContent="Cleaning up…";
+  const t0=performance.now();
+  const {body:j}=await post("/api/clone/cleanup",
+    {created_objects:LASTRUN.created_objects,plan:PLAN,dry_run:false,confirm:"CLEANUP",
+     cat_token:$("cat_token").value.trim()});
+  const el=fmtDur(performance.now()-t0);
+  if(j.error){ $("status").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return; }
+  const r=j.run, c=r.counts;
+  $("status").innerHTML=(c.failed?'<span class="err">Cleanup had failures</span>'
+                                 :'<span class="ok">Cleanup done</span>')+
+                        ' <span class="mut">· '+el+'</span>';
+  $("cleanview").innerHTML=`
+    <div class="banner${c.failed?' stop':''}"><b>Removed ${c.removed} of ${c.attempted}.</b>
+      ${c.failed?c.failed+' failed. ':''}${c.unremovable} could not be removed by API.
+      <br>Journal: <code>${esc(j.journal_path||'—')}</code></div>
+    <table><tr><th>Kind</th><th>Name</th><th>Call</th><th>Status</th></tr>
+      ${r.journal.map(e=>`<tr><td>${esc(e.kind)}</td><td>${esc(e.label||'—')}</td>
+        <td><code>${esc(e.method)} ${esc(e.path)}</code>
+          ${e.error?'<br><span class="err">'+esc(e.error)+'</span>':''}</td>
+        <td>${typeof e.status==='number'&&e.status<300?'<span class="ok">'+e.status+'</span>'
+             :'<span class="err">'+esc(e.status)+'</span>'}</td></tr>`).join("")}</table>`;
+}
+
+function dlPlan(){const b=new Blob([JSON.stringify(PLAN,null,2)],{type:"application/json"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(b);
+  a.download="clone-plan.json";a.click();}
+function copyPlan(){navigator.clipboard.writeText(JSON.stringify(PLAN,null,2));}
+
+if(window.__DEV_CREDS__){const c=window.__DEV_CREDS__;
+  if(c.client_id&&$("src_client"))$("src_client").value=c.client_id;
+  if(c.cat_token&&$("cat_token"))$("cat_token").value=c.cat_token;}
+$("capture").onclick=capture;
+$("loadents").onclick=loadEntities;
+drawStages();
+</script>
+</body>
+</html>

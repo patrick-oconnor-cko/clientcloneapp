@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Local secrets — never commit tokens/keys (the CAT bearer token is short-lived
+# and always pasted at run time)
+*.token
+.env
+.claude/settings.local.json
+# Note: app/dev-creds.json holds ONLY a sandbox client id and is intentionally committed
+# for prefill convenience. Never put API keys (pk_/sk_) or the CAT bearer token in it —
+# GitHub push protection blocks them. Anything more goes in a *.local.json, ignored here:
+app/dev-creds.local.json
+*.local.json
+
+# Live run journals — real created-object ids from write runs
+clone-runs/*.jsonl
+# Raw captures — a real client's full configuration: addresses, emails, bank details
+clone-runs/*.json

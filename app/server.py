@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+Sandbox CAT client clone — local front end for the clone tool.
+
+Run:  python3 app/server.py            (serves http://localhost:8788)
+Then open the URL, paste Client ID + CAT API key, and work through the stages:
+Load entities -> Capture -> review plan -> Dry run -> Apply -> Verify -> Clean up.
+
+Nothing is persisted except run journals under clone-runs/: credentials live only
+for the duration of the request.
+
+THIS APPLICATION WRITES. Every path defaults to not writing, and a live run needs
+dry_run=false AND confirm=="CLONE" AND a token. CAT offers no rollback, so read the
+safety notes in README.md before running anything live.
+"""
+import json, pathlib, datetime, http.server, socketserver
+import clone_capture as cc
+import clone_apply as capp
+import clone_cleanup as ccl
+
+HERE = pathlib.Path(__file__).parent
+PORT = 8788
+CAT_BASE = "https://client-admin.cko-sbox.ckotech.co/api"
+# Live clone runs journal here, one .jsonl per run. Gitignored: contains
+# real created-object ids from a write run.
+RUNS_DIR = HERE.parent / "clone-runs"
+
+
+def clone_capture_handler(payload):
+    """Read-only: reads the source client and returns an ordered clone plan."""
+    client_id = (payload.get("client_id") or "").strip()
+    token     = (payload.get("cat_token") or "").strip()
+    if not client_id or not token:
+        return {"error": "client_id and cat_token are required"}
+    cap  = cc.capture(CAT_BASE, token, client_id,
+                      only_entity=(payload.get("only_entity") or "").strip() or None)
+    # Persist the RAW capture, every time, before anything is derived from it. When a
+    # plan skips something, the question is always "what did CAT actually return?" — and
+    # until now the only answer was to ask someone to paste it. Gitignored with the
+    # journals; also the first real saved capture the tests have ever had available.
+    cap_path = None
+    try:
+        stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        cap_path = RUNS_DIR / f"capture-{stamp}-{client_id}.json"
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        cap_path.write_text(json.dumps(cap, indent=1, default=str), encoding="utf-8")
+    except Exception as ex:  # never let bookkeeping break a capture
+        cap_path = f"not saved: {type(ex).__name__}: {ex}"
+    if not cap.get("entities"):
+        return {"error": f"No entities found for {client_id} "
+                         + (f"matching entity {cap.get('only_entity')}. "
+                            if cap.get("only_entity") else "")
+                         + "(check the ids and that the token is valid/unexpired)."}
+    plan = cc.build_plan(cap, (payload.get("new_client_name") or "").strip() or None)
+    return {"plan": plan, "problems": cc.validate_plan(plan),
+            "calls": cap.get("_meta", {}).get("calls"),
+            "capture_path": str(cap_path),
+            # what cleanup could undo if this plan were applied — shown before committing
+            "cleanup_outlook": ccl.cleanup_outlook(plan)}
+
+
+def clone_apply_handler(payload):
+    """Dry-run or live-apply a clone plan.
+
+    A live run requires ALL of: dry_run explicitly false, confirm == "CLONE", and a CAT
+    token. Anything missing falls back to an error rather than a write — the default of
+    every path here is "do not write".
+    """
+    plan = payload.get("plan")
+    if not isinstance(plan, dict) or not plan.get("steps"):
+        return {"error": "a plan with steps is required"}
+
+    live = payload.get("dry_run") is False
+    if not live:
+        run = capp.apply_plan(plan, dry_run=True,
+                             manual_values=payload.get("manual_values") or {})
+        return {"run": run, "summary": capp.render_run(run)}
+
+    # ---- live write path ----
+    token = (payload.get("cat_token") or "").strip()
+    if payload.get("confirm") != "CLONE":
+        return {"error": 'live apply requires confirm == "CLONE"'}
+    if not token:
+        return {"error": "cat_token is required for a live apply"}
+
+    # Journal first, always. A partial run has no API rollback, so this file is the only
+    # record of what was created.
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    src = (plan.get("source") or {}).get("client_id") or "unknown"
+    jpath = RUNS_DIR / f"clone-{stamp}-{src}.jsonl"
+
+    run = capp.apply_plan(plan, base=CAT_BASE, token=token, dry_run=False,
+                          stop_on_error=True, pace_seconds=0.35,
+                          manual_values=payload.get("manual_values") or {},
+                          journal_path=str(jpath))
+    return {"run": run, "summary": capp.render_run(run), "journal_path": str(jpath)}
+
+
+def clone_entities_handler(payload):
+    """List a client's entities so the UI can offer a scope picker. Read-only, 1 GET."""
+    client_id = (payload.get("client_id") or "").strip()
+    token     = (payload.get("cat_token") or "").strip()
+    if not client_id or not token:
+        return {"error": "client_id and cat_token are required"}
+    r = cc.Reader(CAT_BASE, token)
+    ents, code = r.hal(f"/clients/{client_id}/entities?limit=25&skip=0", "entities")
+    if not ents:
+        return {"error": f"No entities found for {client_id} (HTTP {code})"}
+    return {"entities": [{"id": e.get("id"), "name": e.get("name"),
+                          "status": e.get("status"), "region": e.get("region")}
+                         for e in ents]}
+
+
+def clone_verify_handler(payload):
+    """Read back created objects from CAT. GETs only — proves what actually exists."""
+    objs = payload.get("created_objects")
+    token = (payload.get("cat_token") or "").strip()
+    if not isinstance(objs, list) or not objs:
+        return {"error": "created_objects is required"}
+    if not token:
+        return {"error": "cat_token is required"}
+    return ccl.verify(objs, CAT_BASE, token)
+
+
+def clone_cleanup_handler(payload):
+    """Remove what a clone run created, as far as CAT allows.
+
+    Same gating as apply: live requires dry_run false + confirm CLEANUP + a token.
+    """
+    objs = payload.get("created_objects")
+    if not isinstance(objs, list) or not objs:
+        return {"error": "created_objects is required (from a run journal)"}
+    # Never let cleanup touch the source account: it deactivates clients and entities,
+    # so a bad id would take down what we cloned FROM.
+    prot = ccl.source_ids_of(payload.get("plan") or {})
+    if payload.get("dry_run") is not False:
+        return {"run": ccl.run_cleanup(objs, dry_run=True, protected_ids=prot)}
+    token = (payload.get("cat_token") or "").strip()
+    if payload.get("confirm") != "CLEANUP":
+        return {"error": 'live cleanup requires confirm == "CLEANUP"'}
+    if not token:
+        return {"error": "cat_token is required for a live cleanup"}
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    jpath = RUNS_DIR / f"cleanup-{stamp}.jsonl"
+    return {"run": ccl.run_cleanup(objs, base=CAT_BASE, token=token, dry_run=False,
+                                   journal_path=str(jpath), protected_ids=prot),
+            "journal_path": str(jpath)}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="application/json"):
+        b = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code); self.send_header("Content-Type", ctype)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_OPTIONS(self):
+        self._send(204, "")
+    def _page(self, name):
+        """Serve a tracked HTML page, injecting local dev creds for prefill."""
+        html = (HERE/name).read_text()
+        # Inject prefill creds from a local file (if present) so they never live in
+        # the tracked HTML. Missing file -> fields start empty.
+        creds_file = HERE/"dev-creds.json"
+        if creds_file.exists():
+            try:
+                creds = json.loads(creds_file.read_text())
+                tag = "<script>window.__DEV_CREDS__=" + json.dumps(creds) + ";</script>"
+                html = html.replace("</head>", tag + "</head>", 1)
+            except Exception:
+                pass
+        self._send(200, html, "text/html; charset=utf-8")
+
+    def do_GET(self):
+        if self.path in ("/", "/clone", "/clone.html"):
+            self._page("clone.html")
+        else:
+            self._send(404, json.dumps({"error":"not found"}))
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(n) or b"{}"
+        try: payload = json.loads(raw)
+        except Exception: return self._send(400, json.dumps({"error":"bad json"}))
+        if self.path == "/api/clone/capture":
+            try: result = clone_capture_handler(payload)
+            except Exception as ex: result = {"error": f"{type(ex).__name__}: {ex}"}
+            return self._send(200 if "error" not in result else 400, json.dumps(result))
+        if self.path == "/api/clone/entities":
+            try: result = clone_entities_handler(payload)
+            except Exception as ex: result = {"error": f"{type(ex).__name__}: {ex}"}
+            return self._send(200 if "error" not in result else 400, json.dumps(result))
+        if self.path == "/api/clone/verify":
+            try: result = clone_verify_handler(payload)
+            except Exception as ex: result = {"error": f"{type(ex).__name__}: {ex}"}
+            return self._send(200 if "error" not in result else 400, json.dumps(result))
+        if self.path == "/api/clone/cleanup":
+            try: result = clone_cleanup_handler(payload)
+            except Exception as ex: result = {"error": f"{type(ex).__name__}: {ex}"}
+            return self._send(200 if "error" not in result else 400, json.dumps(result))
+        if self.path == "/api/clone/apply":
+            try: result = clone_apply_handler(payload)
+            except Exception as ex: result = {"error": f"{type(ex).__name__}: {ex}"}
+            code = 200 if "error" not in result else (501 if result.get("stage") else 400)
+            return self._send(code, json.dumps(result))
+        self._send(404, json.dumps({"error":"not found"}))
+    def log_message(self, *a): pass  # quiet
+
+if __name__ == "__main__":
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as httpd:
+        print(f"Sandbox CAT client clone -> http://localhost:{PORT}")
+        httpd.serve_forever()
