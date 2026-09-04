@@ -1074,14 +1074,22 @@ def build_plan(cap, target_client_name=None):
             "currency validity was not checked against CAT: this capture carries no "
             "valid_currencies data. The explicit SLL/HRK/ZWL/LBP rules still applied.",
             kind="capture", action="not_checked"))
-    elif cur_cfg.get("unavailable"):
-        flag(make_flag(
-            "currency_validation_unavailable",
-            "currency validity could not be checked against CAT for: "
-            + ", ".join(cur_cfg["unavailable"])
-            + ". The explicit SLL/HRK/ZWL/LBP rules still applied, but a currency CAT "
-              "has retired since would not be caught.",
-            kind="capture", endpoints=cur_cfg["unavailable"], action="not_checked"))
+    else:
+        # /payout-routes/configuration returns 400 on every capture and gates nothing:
+        # payout routes are not created by the plan, only read back and compared after
+        # apply. Flagging it every run was noise (removed 2026-09-04 at Patrick's request);
+        # it stays in the capture's `unavailable` list for diagnosis. Any OTHER list being
+        # unavailable still matters — those gate profile/processor/account currencies.
+        gating = [u for u in cur_cfg.get("unavailable") or []
+                  if not u.startswith("/payout-routes/configuration")]
+        if gating:
+            flag(make_flag(
+                "currency_validation_unavailable",
+                "currency validity could not be checked against CAT for: "
+                + ", ".join(gating)
+                + ". The explicit SLL/HRK/ZWL/LBP rules still applied, but a currency CAT "
+                  "has retired since would not be caught.",
+                kind="capture", endpoints=gating, action="not_checked"))
 
     def add(kind, method, path, body, provides=None, requires=(), op=None, notes=None,
             entity=None, label=None, parent=None, provides_from=None, retry=None,
@@ -1915,7 +1923,7 @@ def build_plan(cap, target_client_name=None):
                 "network_tokens_manual",
                 # The source's settings travel on the flag as source_configuration; the
                 # message itself is the one-line instruction Patrick asked for.
-                "NETWORK TOKEN SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION STORE",
+                "NETWORK TOKEN SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT",
                 kind="client_network_tokens", object_id=src_cli,
                 default_entity_id=default_eid, source_configuration=to_replicate,
                 source=cap.get("network_tokens_source"), action="not_created"))
@@ -1966,6 +1974,17 @@ def build_plan(cap, target_client_name=None):
                     "unknown and there is no known-good write; client-level tier IS "
                     "applied")):
         skipped.append({"kind": k, "reason": why})
+
+    # Two client-level services this tool can neither read nor write (no CAT endpoint for
+    # RTAU; Intelligent Acceptance is out of scope). Raised on EVERY plan as manual steps,
+    # in the same one-line form as the network-tokens flag, so the handover always lists
+    # them — a skipped[] entry alone was too easy to miss.
+    flag(make_flag("rtau_manual",
+                   "RTAU SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT",
+                   kind="client", object_id=src_cli, action="not_created"))
+    flag(make_flag("intelligent_acceptance_manual",
+                   "IA SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT",
+                   kind="client", object_id=src_cli, action="not_created"))
 
     return {
         "plan_version": PLAN_VERSION,

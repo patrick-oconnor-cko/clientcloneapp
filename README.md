@@ -25,13 +25,30 @@ python3 app/server.py     # http://localhost:8788
 |---|---|
 | Client ID | prefills from `app/dev-creds.json` — this is the **source** client |
 | **CAT API bearer token** | **paste this** — short-lived Okta token, expires in ~1h |
-| Sandbox Secret Key | optional, typed each session — `sk_sbox_…`; used only by steps that call the Checkout sandbox API |
-| Sandbox Public Key | optional, typed each session — `pk_sbox_…`; same, for endpoints that take a public key |
+| Sandbox Secret Key | `sk_sbox_…` — prefills from the gitignored `app/dev-creds.local.json` if present, else typed; used only by steps that call the Checkout sandbox API |
+| Sandbox Public Key | `pk_sbox_…` — same, for endpoints that take a public key |
 
-The page is the pipeline as gates:
+Top right, a **Sandbox → Sandbox / Prod → Sandbox** toggle says where the *source* is read
+from (the clone is always created in sandbox). It defaults to Sandbox → Sandbox. Nothing
+branches on it yet; the page keeps it in `MODE` for the conditional logic to come — the first
+consumer should be the Prod → Sandbox payout-details callout (TODO §00.5).
 
-**Load entities → Capture source config → review plan (downloadable JSON) → Dry run →
-Apply → Verify → Clean up**
+The three stage cards across the top are buttons, each its own page. The same numbered
+warnings open every page so they are never out of sight — each warning carries a short label
+(its flag code) and a coloured pill saying what happened: *object still created — only this
+value is left out*, *not created*, *value substituted*, *needs a value from you*:
+
+- **Capture** — what was fetched from the source (client, scope, CAT calls, saved capture),
+  what will be created, and what will not.
+- **Plan** — every endpoint the apply will hit (grouped, and in order), the dry run, and
+  the delete/deactivate steps cleanup will be able to offer afterwards.
+- **Apply** — the live-apply box, live progress as each step is journalled (the page polls
+  `/api/clone/progress` once a second; the server is threaded so the poll is answered
+  mid-run), a read-out of what was done and any run-time findings, then the clean-up and
+  verify tools for that run underneath.
+
+The pipeline is still gated in order: **Load entities → Capture → Plan / Dry run → Apply →
+Verify → Clean up**.
 
 After **Load entities**, tick the entities you want cloned (all are ticked by default; "all"
 and "none" shortcuts sit above the list). Scope a first run to one entity. Same information,
@@ -48,8 +65,8 @@ Python **3.9+** and nothing else — pure standard library. No dependencies to i
 ### Tests
 
 ```bash
-python3 tests/test_plan.py        # ~200 assertions, well under a second
-python3 tests/mutation_check.py   # proves those assertions have teeth
+python3 tests/test_plan.py        # 227 tests, well under a second
+python3 tests/mutation_check.py   # 107 mutants — proves those tests have teeth
 ```
 
 No token, no network, no writes. The suite asserts on the plan document and on a dry run:
@@ -104,8 +121,18 @@ sessions_profile_processor → payment_routing_rule → payout_routing_rule →
 payout_setting → payout_route_check
 ```
 
-**Network tokens are not cloned — every plan flags them as a manual step**
-(`network_tokens_manual`, carrying the source's settings to replicate). The write path was
+**Three client-level services are never cloned, and every plan says so in one line each**,
+at the top of every page:
+
+```
+NETWORK TOKEN SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT
+RTAU SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT
+IA SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT
+```
+
+(`network_tokens_manual` — raised when the source has NT, and carrying the source's settings
+as structured fields; `rtau_manual` and `intelligent_acceptance_manual` — raised always, since
+RTAU has no CAT route and IA is out of scope.) The network-tokens write path was
 exercised end to end before deciding this, and the facts are worth keeping: CAT's
 `/clients/{id}/network-tokens` and the NT portal
 (`nt-portal.sbox.checkout.internal/vault-nt-portal/cat/configurations/{id}`) are **two
@@ -135,12 +162,13 @@ otherwise silently lose its custom rules and ML threshold control. The body is t
 proven fields — `id` (the clone's, as a placeholder), `name` (the clone's), `tier`,
 `read_only_restriction_enabled`; timestamps, `_links` and the feature text are still dropped.
 `name` was learned live: reducing the body to `tier` alone returned `client_name_required`.
-With a valid body the PUT then returned **404 immediately after client create**, so it now
-retries like `vault_lookup` (6 × 3s) on the reading that CAT provisions default risk
-settings asynchronously. **Unconfirmed:** the contract has separate create (`POST`) and
-update (`PUT`) operations, so the resource may instead never exist until created — a 404
-that persists through every retry means the step must become a `POST`. It sits at step 2
-on purpose: if its body is ever wrong, the run halts having created only a client.
+With a valid body the PUT returned **404 immediately after client create**, so it retries
+like `vault_lookup` (6 × 3s). **Confirmed across seven live runs:** CAT provisions default
+risk settings asynchronously — the PUT succeeded on attempt 3 or 4 (7–12s after client
+create) every time and never needed a `POST`. The budget leaves ~2 spare attempts; raise
+`attempts` rather than rediscover this. It sits at step 2 on purpose: if its body is ever
+wrong, the run halts having created only a client. **Reserve rules under risk settings are
+not carried** — see TODO §00.1.
 
 `entity_service` is the one PUT a plan emits: a channel's `services[]` *references*
 something enabled on the entity rather than enabling it, so a source channel carrying a
@@ -174,6 +202,11 @@ Everything defaults to not writing, and the defaults are layered rather than tru
   what you cloned *from*.
 - **`GET` steps never enter `created_objects`** — that list is what cleanup reverses, and a
   read created nothing to reverse.
+- **Sandbox API keys are sandbox-only.** Every route refuses a key not prefixed `sk_sbox_` /
+  `pk_sbox_`, and a step that declares sandbox auth is **blocked** without its key — never
+  sent with the CAT token. The prefill drops non-sandbox values before they reach the page.
+- **Progress is read-only.** `/api/clone/progress` returns slim journalled entries (no
+  bodies, no credentials) for a run the page started; an unknown `run_id` is an error.
 
 ---
 
@@ -261,8 +294,16 @@ Two mechanisms, because neither is sufficient alone:
 Three of those four endpoints declare no response schema, so the parser accepts every
 shape CAT uses elsewhere and returns **`None` (not an empty set)** when it recognises
 nothing. That distinction is load-bearing: an empty set would mean "no currency is
-valid" and would drop every currency in the plan. When a lookup is unavailable the plan
-carries a `currency_validation_unavailable` flag rather than silently looking clean.
+valid" and would drop every currency in the plan. When a lookup that gates something is
+unavailable the plan carries a `currency_validation_unavailable` flag rather than silently
+looking clean. **Exception:** `/payout-routes/configuration` returns 400 on every capture
+and gates nothing — routes are read back after apply, not created — so it is recorded in
+the capture's `valid_currencies.unavailable` but does not raise the flag.
+
+When a currency is dropped the object is still created; only the code is left out, and the
+warning says so in those words (`profile 'X' will still be created, but LBP cannot be added
+and is left out of its currencies — …`). A currency *account* in a dead holding currency is
+the one case that is not created.
 
 Every place a bare currency code reaches CAT goes through the same rules: a profile's
 `currencies`, an Amex `SE_CCY` row, a processor's `currencies` **and**
@@ -292,7 +333,7 @@ The first five are the original set; the rest were found in the multi-entity run
 | **Service keys can be composites.** The `prism` (FraudDetection) service key is `<client_id>\|<entity_id>` — both source ids. Remapping only the vault key sent it verbatim. Every service key is now remapped token by token, and prism is **enabled on the entity first** (`PUT /entities/{id}/services/prism`) because a channel service *references* an enabled service, it doesn't enable it. | `invalid_prism_merchant_service` |
 | **A manual (profile-less) processor cannot be created by API.** The single create route returns 503 for one. Flagged and skipped, with its sessions link. | `gateway_manual_processor_creation_not_supported` (503) |
 | **The payout-routes list shares no field names with its create.** The list is a UI-option shape (`country_value`, `currency_label`, `schemes_label`); reading it with the create's names sent nulls. Routes turned out to be provisioned capability — now parity-checked, never created. | `currency_code_required` + `country_code_required` |
-| **Risk settings PUT wants part of the UI echo back**, and a valid body returned **404** 0.35s after client create. Body is now `id` (clone placeholder), `name` (clone's), `tier`, `read_only_restriction_enabled`; the PUT retries. Whether it is a race or needs a POST first is unconfirmed. | `client_name_required`, then `404` |
+| **Risk settings PUT wants part of the UI echo back**, and a valid body returned **404** 0.35s after client create. Body is now `id` (clone placeholder), `name` (clone's), `tier`, `read_only_restriction_enabled`; the PUT retries. Confirmed a race: 7/7 live runs succeeded on attempt 3–4, no POST needed. | `client_name_required`, then `404` |
 | **CAT's `/network-tokens` GET returns the blank create template**, even for a configured client — every field a `default_value`, no `default_entity_id`. The configuration lives on the NT portal. Two runs "completed" with NT silently skipped before the journal carried plan flags. | (no error — a silent skip, which is worse) |
 
 > **The swagger is not authoritative for writes.** The v2 profile POST declares its request
@@ -335,6 +376,22 @@ Not yet verified:
   NT `identification_value`, `SE_CCY[].service_establishment_number` — manual-entry inputs
   are the main open work (TODO #2).
 
+Known gaps — configuration the source has that the clone does **not** get today (TODO §00,
+in priority order): risk-settings **reserve rules**, **FX** configuration, **pricing
+profiles** (excluded by policy so far), **arrears** configuration, the **Prod → Sandbox
+payout-schedule account details** callout, **reporting profiles**, and **webhooks**. Until
+each is built or ruled out it should become a one-line manual-step flag like the three above.
+
+**Webhooks were never built** (checked 2026-09-04: nothing in code, history or journals).
+They are not a CAT resource. They are **Workflows in the client-facing Checkout API** —
+confirmed via the `checkout-mcp-sandbox` MCP: `GET /workflows`, `GET /workflows/{id}`,
+`POST /workflows`, per-workflow `/actions` and `/conditions`, and `GET /workflows/event-types`;
+the webhook itself is a `webhook-action` on a workflow. They authenticate with a **secret
+key**, which is what the `auth: "sandbox_secret"` seam in `clone_apply` exists for. Reading
+the source needs the *source* client's `sk_sbox_`; creating on the clone needs the
+*destination's*, which cannot exist until its access keys are created by hand — so those
+steps must stay blocked until then. Design notes in TODO §00.7.
+
 ---
 
 ## Layout
@@ -342,12 +399,13 @@ Not yet verified:
 ```
 TODO.md                # open work and API quirks — read first
 app/
-  server.py            # stdlib HTTP server, port 8788
-  clone.html           # front end (the pipeline as gates)
+  server.py            # stdlib threaded HTTP server, port 8788 (+ /api/clone/progress)
+  clone.html           # front end: three stage pages (Capture / Plan / Apply), no build step
   clone_capture.py     # read source -> ordered plan  (GET only)
-  clone_apply.py       # execute a plan (dry-run by default)
+  clone_apply.py       # execute a plan (dry-run by default; on_step progress hook)
   clone_cleanup.py     # reverse a run, as far as CAT allows
-  dev-creds.json       # SANDBOX-ONLY prefill
+  dev-creds.json       # tracked: sandbox source client id only
+  dev-creds.local.json # gitignored, mode 600: your sandbox_sk / sandbox_pk for prefill
 tests/
   fixtures.py          # synthetic captures — the reference client's SHAPE, not a recording
   test_plan.py         # plan + dry-run assertions (no token, no network)
@@ -373,8 +431,8 @@ particular way and what happened when it wasn't.
 ## Credentials
 
 `app/dev-creds.json` holds a **sandbox-only** Client ID for prefill convenience and nothing
-else (the front end uses only `client_id` and `cat_token`). It used to carry a sandbox
-`pk`/`sk` pair that nothing read; GitHub push protection flagged it, so it was removed. Note
+else. It used to carry a sandbox `pk`/`sk` pair; GitHub push protection flagged it, so it was
+removed and the keys moved to the gitignored local file described below. Note
 that `server.py` injects the *whole file* into the page as `window.__DEV_CREDS__`, so
 anything added to it reaches the browser — never put API keys or a CAT bearer token in it;
 the token is short-lived and always pasted at run time. Your own sandbox keys can be cached
@@ -384,7 +442,8 @@ any value without the `sk_sbox_` / `pk_sbox_` prefix so a production key can nev
 pre-filled. The CAT token is never cached.
 
 **Sandbox API keys** (`Sandbox Secret Key` / `Sandbox Public Key` on the side panel) are
-manual, optional and per-session. The page sends them with every request alongside the
+optional and prefilled from the local file above when it exists, otherwise typed. The CAT
+token is always pasted; nothing in this app can obtain one. The page sends them with every request alongside the
 CAT token; `server.sandbox_keys` refuses anything not prefixed `sk_sbox_` / `pk_sbox_` on
 every route, so a production key never gets past the handler. Inside `clone_apply`, a step
 opts in with `auth: "sandbox_secret"` (or `"sandbox_public"`) and is then sent with that key

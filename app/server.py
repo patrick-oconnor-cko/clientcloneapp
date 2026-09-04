@@ -15,7 +15,7 @@ THIS APPLICATION WRITES. Every path defaults to not writing, and a live run need
 dry_run=false AND confirm=="CLONE" AND a token. CAT offers no rollback, so read the
 safety notes in README.md before running anything live.
 """
-import json, pathlib, datetime, http.server, socketserver
+import json, pathlib, datetime, http.server, socketserver, threading
 import clone_capture as cc
 import clone_apply as capp
 import clone_cleanup as ccl
@@ -136,11 +136,62 @@ def clone_apply_handler(payload):
     src = (plan.get("source") or {}).get("client_id") or "unknown"
     jpath = RUNS_DIR / f"clone-{stamp}-{src}.jsonl"
 
-    run = capp.apply_plan(plan, base=CAT_BASE, token=token, dry_run=False,
-                          stop_on_error=True, pace_seconds=0.35,
-                          manual_values=payload.get("manual_values") or {},
-                          journal_path=str(jpath), sandbox_keys=keys)
-    return {"run": run, "summary": capp.render_run(run), "journal_path": str(jpath)}
+    # Live progress: the page picks a run_id, polls /api/clone/progress with it while this
+    # request is in flight, and sees each step the moment it is journalled.
+    run_id = str(payload.get("run_id") or stamp)
+    progress_start(run_id, len(plan["steps"]))
+    try:
+        run = capp.apply_plan(plan, base=CAT_BASE, token=token, dry_run=False,
+                              stop_on_error=True, pace_seconds=0.35,
+                              manual_values=payload.get("manual_values") or {},
+                              journal_path=str(jpath), sandbox_keys=keys,
+                              on_step=lambda e, n: progress_step(run_id, e))
+    finally:
+        progress_finish(run_id)
+    return {"run": run, "summary": capp.render_run(run), "journal_path": str(jpath),
+            "run_id": run_id}
+
+
+# ---- live progress for the page -------------------------------------------------
+# One slim entry per journalled step, kept in memory for the life of the process. The
+# journal file stays the durable record; this is only what the page polls while an apply
+# is in flight. Never carries a request body or a credential.
+PROGRESS = {}
+PROGRESS_LOCK = threading.Lock()
+PROGRESS_FIELDS = ("seq", "kind", "op", "method", "path", "status", "error", "created_id",
+                   "resolved_id", "attempts", "auth", "elapsed_ms")
+
+
+def progress_start(run_id, total):
+    with PROGRESS_LOCK:
+        PROGRESS[run_id] = {"total": total, "entries": [], "done": False,
+                            "started_at": datetime.datetime.utcnow().isoformat() + "Z"}
+
+
+def progress_step(run_id, entry):
+    slim = {k: entry[k] for k in PROGRESS_FIELDS if k in entry}
+    with PROGRESS_LOCK:
+        p = PROGRESS.get(run_id)
+        if p is not None:
+            p["entries"].append(slim)
+
+
+def progress_finish(run_id):
+    with PROGRESS_LOCK:
+        p = PROGRESS.get(run_id)
+        if p is not None:
+            p["done"] = True
+
+
+def clone_progress_handler(payload):
+    """Where a live apply is up to. Read-only, no CAT call; unknown run_id is an error."""
+    run_id = str(payload.get("run_id") or "")
+    with PROGRESS_LOCK:
+        p = PROGRESS.get(run_id)
+        if p is None:
+            return {"error": f"unknown run_id {run_id!r}"}
+        return {"run_id": run_id, "total": p["total"], "done": p["done"],
+                "started_at": p["started_at"], "entries": [dict(e) for e in p["entries"]]}
 
 
 def clone_entities_handler(payload):
@@ -280,11 +331,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as ex: result = {"error": f"{type(ex).__name__}: {ex}"}
             code = 200 if "error" not in result else (501 if result.get("stage") else 400)
             return self._send(code, json.dumps(result))
+        if self.path == "/api/clone/progress":
+            try: result = clone_progress_handler(payload)
+            except Exception as ex: result = {"error": f"{type(ex).__name__}: {ex}"}
+            return self._send(200 if "error" not in result else 404, json.dumps(result))
         self._send(404, json.dumps({"error":"not found"}))
     def log_message(self, *a): pass  # quiet
 
+
+class Server(socketserver.ThreadingTCPServer):
+    """Threaded so the page can poll /api/clone/progress while an apply is in flight —
+    a single-threaded server would hold the poll until the whole run finished."""
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 if __name__ == "__main__":
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as httpd:
+    with Server(("127.0.0.1", PORT), Handler) as httpd:
         print(f"Sandbox CAT client clone -> http://localhost:{PORT}")
         httpd.serve_forever()

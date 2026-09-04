@@ -8,8 +8,17 @@
   finished. That step has since been removed (see below); a plan built from the same
   capture now yields **86 steps, none optional**. 3-entity reference client
   `cli_scna7ew7mxdenl3h36zlmkyh6m`.
-- **Tests:** `python3 tests/test_plan.py` → 218 pass. `python3 tests/mutation_check.py` →
-  103/103 mutants caught. Both need no token or network.
+- **Tests:** `python3 tests/test_plan.py` → 227 pass. `python3 tests/mutation_check.py` →
+  107/107 mutants caught. Both need no token or network.
+- **Three always-on manual-step warnings** on every plan, one line each: NETWORK TOKEN /
+  RTAU / IA `SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT`
+  (`network_tokens_manual`, `rtau_manual`, `intelligent_acceptance_manual`).
+- **Front end is tabbed (2026-09-04):** stage cards are buttons → Capture / Plan / Apply
+  pages, warnings at the top of each. Live apply shows real per-step progress:
+  `apply_plan(on_step=…)` → `server.PROGRESS[run_id]` → `POST /api/clone/progress`, polled
+  by the page; `server.Server` is a `ThreadingTCPServer` so the poll is answered mid-run.
+  Cleanup and verify live under the results on the Apply page. `MODE` (Sandbox→Sandbox /
+  Prod→Sandbox toggle) exists but nothing branches on it yet.
 - **Warnings render as a numbered list** at the top of the plan view, each labelled by
   flag code with an action pill; a dropped currency reads "X will still be created, but
   CUR cannot be added and is left out of…" so it is never mistaken for a dropped object.
@@ -46,14 +55,74 @@
   attempt 3 or 4 every time (6.8s–11.6s after client create), never a 404 that outlasted the
   retries. No POST is needed. The 6×3s budget leaves only ~2 spare attempts, so raise
   `attempts` rather than rediscover this if it ever fails with a persistent 404.
-- **Cosmetic:** `/payout-routes/configuration` returns 400, so
-  `currency_validation_unavailable` fires every run.
+- **`/payout-routes/configuration` returns 400 on every capture.** It gates nothing (routes
+  are read back after apply, not created), so since 2026-09-04 it no longer raises
+  `currency_validation_unavailable`; it is still recorded in the capture's
+  `valid_currencies.unavailable` for diagnosis. The other three lists still warn if missing.
 - Standing operator actions the tool flags but cannot do: VAS pricing (NT prerequisite),
   RTAU, processing region, entity-level risk settings, Compass display currency if
   immutable, payout corridors missing on the clone.
 
 Open work, in priority order. A one-entity scope produces **33 steps**; the three-entity
 reference client, 86.
+
+---
+
+## 00. Gaps Patrick has called out (2026-09-04) — not yet cloned
+
+Each of these is configuration the source has that the clone does not get today. Until
+each is either built or ruled out, it should at minimum become a plan flag (like the three
+`… MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT` lines) so it reaches the handover.
+None of them is flagged yet except pricing profiles (in `skipped[]`).
+
+1. **Risk settings — reserve rules are missing.** The client-level Fraud Detection tier is
+   applied (`client_risk_settings` PUT, verified live), but reserve rules under risk
+   settings are not read or written. Find where they live in CAT (client- or
+   entity-level; the entity `risk-settings` endpoint has no known-good write), capture a
+   live GET, and add a step or a flag.
+2. **FX configuration missing.** Not captured at all. Locate the endpoint(s), confirm they
+   are readable, and decide clone vs flag.
+3. **Pricing profiles missing.** Currently in `skipped[]` as "commercially sensitive;
+   excluded by policy". Revisit the policy: if pricing must be carried, it needs a
+   known-good create body; if not, promote the skip to a top-of-page manual-step flag.
+   Note VAS pricing is also the network-tokens prerequisite.
+4. **Arrears configuration missing.** Not captured. Same treatment as FX: find, read, decide.
+5. **Prod → Sandbox: payout-schedule account details will not transfer — needs a callout,
+   then a fix.** `payout_setting` carries `payment_instrument` (bank details) and
+   `payout_schedule` from the source; when the source is production and the target is
+   sandbox those details cannot be carried across. When `MODE === "prod"` the plan must
+   (a) flag it at the top of the page and (b) decide what to send in their place. Nothing
+   branches on `MODE` yet — this is the first thing that should.
+6. **Reporting profiles not working.** Out of scope per CLAUDE.md ("this application does
+   not read the reporting-profile … services"), so a cloned client has none. Establish
+   what "not working" means on the clone (missing entirely vs created but broken), then
+   either clone it or raise a manual-step flag.
+7. **Webhooks — never built (checked 2026-09-04: no code, no history, no journal ever
+   mentioned them).** They are not in CAT. They live in the **client-facing Checkout API**
+   as Workflows, authenticated with a **secret key** — exactly the `auth: "sandbox_secret"`
+   seam `clone_apply` already has. Operations confirmed via the `checkout-mcp-sandbox` MCP
+   (Workflows tag, 21 operations): `getAllWorkflows` GET `/workflows`, `getWorkflow` GET
+   `/workflows/{workflowId}`, `addWorkflow` POST `/workflows`, `addWorkflowAction` POST
+   `/workflows/{id}/actions`, `addWorkflowCondition` POST `/workflows/{id}/conditions`,
+   `getEventTypes` GET `/workflows/event-types`; the webhook is a `webhook-action` schema
+   (`get-webhook-action` on read). Next: `get_operation` + `get_schema` on those to learn
+   whether `addWorkflow` accepts nested actions/conditions in one body and whether the
+   action's signing secret / headers are readable. Design points to settle before coding:
+   - **Two secret keys, not one.** Reading the source's workflows needs the *source*
+     client's `sk_sbox_`; creating them needs the *destination* client's. The destination
+     is brand new and has no access keys (already `skipped[]` as a manual step), so the
+     create steps must stay **blocked** — with a clear message — until the operator has
+     created the destination keys and pasted its secret key. The side panel probably needs
+     a source pair and a destination pair.
+   - **Capture side:** GET the source's workflows and each one's detail (conditions,
+     actions, signing/secret); actions carry the merchant's webhook URL and headers — carry
+     as-is, but the **signature secret / auth headers may be write-only or masked**; check
+     the GET before assuming they can be copied (same trap as `custom_settings.credentials`).
+   - **Plan side:** one `webhook_workflow` step per source workflow, `auth: "sandbox_secret"`,
+     base `api.sandbox.checkout.com`; entity/processing-channel ids inside workflow
+     conditions must be remapped through the id map like every other source id.
+   - **Verify:** read back `/workflows` on the destination and compare counts/names as a
+     run-time flag, like `payout_route_check`.
 
 ---
 
@@ -93,6 +162,8 @@ Codes so far:
 | `compass_settings_not_captured` | the source's Compass settings could not be read; clone keeps defaults |
 | `flow_account_not_captured` | the source's Flow account flag could not be read; clone keeps Flow disabled |
 | `network_tokens_manual` | **always, when the source has NT**: not cloned — the flag carries the source's settings for the operator to replicate in the NT portal |
+| `rtau_manual` | **always**: RTAU has no CAT route; one-line manual step for the destination client |
+| `intelligent_acceptance_manual` | **always**: IA is out of scope; one-line manual step for the destination client |
 | `network_tokens_not_captured` | the source's network tokens form could not be read — check by hand |
 | `network_tokens_default_entity_not_in_scope` | the default billed entity is not in this (scoped) capture |
 | `network_tokens_default_entity_unreadable` | CAT returns only the blank template AND the NT portal returned nothing usable (the flag names the portal's HTTP status) — configure by hand |

@@ -65,10 +65,14 @@ def plan_for(cap, name="Clone Target"):
     return cc.build_plan(cap, name)
 
 
-# Codes a plan built from the reference capture ALWAYS carries: network tokens has a
-# prerequisite this tool cannot satisfy, and the source has no primary_url. Tests that mean
-# "nothing else was flagged" filter exactly these and nothing more.
-EXPECTED_REFERENCE_FLAG_CODES = ("network_tokens_manual",)
+# Codes a plan built from the reference capture ALWAYS carries: the three client-level
+# services this tool cannot carry across (network tokens, RTAU, Intelligent Acceptance),
+# each a one-line manual step. Tests that mean "nothing else was flagged" filter exactly
+# these and nothing more.
+EXPECTED_REFERENCE_FLAG_CODES = ("network_tokens_manual", "rtau_manual",
+                                 "intelligent_acceptance_manual")
+MANUAL_STEP_MESSAGE = re.compile(
+    r"^(NETWORK TOKEN|RTAU|IA) SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT$")
 
 
 def unexpected_warnings(plan):
@@ -147,7 +151,7 @@ class TestReferencePlan(unittest.TestCase):
         problems = cc.validate_plan(self.plan)
         self.assertEqual(len(problems), len(self.EXPECTED_FLAG_CODES))
         for p in problems:
-            self.assertTrue(p.startswith("warning: NETWORK TOKEN SETTINGS"), p)
+            self.assertTrue(p.startswith("warning: ") and MANUAL_STEP_MESSAGE.match(p[9:]), p)
 
     def test_no_warnings_beyond_the_known_prerequisites(self):
         self.assertEqual(sorted(f["code"] for f in self.plan["flags"]),
@@ -891,7 +895,22 @@ class TestClientNetworkTokens(unittest.TestCase):
         # The message is the one-line instruction Patrick asked for (2026-09-04); the
         # detail of what to replicate lives in source_configuration, asserted above.
         self.assertEqual(self.flag["message"],
-                         "NETWORK TOKEN SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION STORE")
+                         "NETWORK TOKEN SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT")
+
+    def test_rtau_and_ia_manual_steps_are_raised_once_on_every_plan(self):
+        # Neither service has a route this tool can use; both must be in every handover.
+        for cap in (fx.reference_capture(), fx.multi_entity_capture(),
+                    fx.no_currency_validation_capture()):
+            plan = plan_for(cap)
+            for code, msg in (("rtau_manual",
+                               "RTAU SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT"),
+                              ("intelligent_acceptance_manual",
+                               "IA SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT")):
+                fl = [f for f in plan["flags"] if f["code"] == code]
+                self.assertEqual(len(fl), 1, code)
+                self.assertEqual(fl[0]["message"], msg)
+                self.assertEqual(fl[0]["action"], "not_created")
+                self.assertEqual(plan["warnings"].count(msg), 1)
 
     def test_nothing_generated_by_onboarding_is_in_the_summary(self):
         blob = json.dumps(self.flag)
@@ -1412,6 +1431,19 @@ class TestCurrencyValidityLookup(unittest.TestCase):
         self.assertEqual(f[0]["action"], "not_checked")
         self.assertIn("/configuration/currencies", f[0]["message"])
 
+    def test_the_payout_routes_list_being_unavailable_is_not_a_warning(self):
+        # It 400s on every capture and gates nothing (routes are read back, not created),
+        # so it must not put a warning at the top of every page. Other lists still do.
+        cap = fx.reference_capture()
+        cap["valid_currencies"]["unavailable"] = ["/payout-routes/configuration (HTTP 400)"]
+        plan = plan_for(cap)
+        self.assertFalse(any(x["code"] == "currency_validation_unavailable" for x in plan["flags"]))
+        cap["valid_currencies"]["unavailable"].append("/currency-accounts/configuration (HTTP 503)")
+        f = [x for x in plan_for(cap)["flags"] if x["code"] == "currency_validation_unavailable"]
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["endpoints"], ["/currency-accounts/configuration (HTTP 503)"])
+        self.assertNotIn("payout-routes", f[0]["message"])
+
     def test_a_capture_with_no_validity_data_is_flagged(self):
         plan = plan_for(fx.legacy_capture_without_validity())
         self.assertTrue(any(x["code"] == "currency_validation_unavailable"
@@ -1843,7 +1875,7 @@ class TestMultiEntity(unittest.TestCase):
 
     def test_validate_plan_reports_only_the_known_prerequisites(self):
         for p in cc.validate_plan(self.plan):
-            self.assertTrue(p.startswith("warning: NETWORK TOKEN SETTINGS"), p)
+            self.assertTrue(p.startswith("warning: ") and MANUAL_STEP_MESSAGE.match(p[9:]), p)
 
     def test_network_tokens_manual_flag_is_raised_once(self):
         self.assertEqual(steps_of(self.plan, "client_network_tokens"), [])
@@ -2057,6 +2089,82 @@ class TestEntityScope(unittest.TestCase):
 def _tmp_runs_dir():
     import tempfile, pathlib as _pl
     return _pl.Path(tempfile.mkdtemp())
+
+
+class TestLiveProgress(unittest.TestCase):
+    """The Apply page shows where a run is up to. apply_plan tells a listener about each
+    step as it is journalled; the server keeps a slim copy per run_id for the page to poll."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plan = plan_for(fx.reference_capture())
+
+    def test_on_step_fires_once_per_step_in_journal_order(self):
+        seen = []
+        with NoSocket():
+            run = capp.apply_plan(self.plan, on_step=lambda e, n: seen.append((e["seq"], n)))
+        self.assertEqual([s for s, _ in seen], [e["seq"] for e in run["journal"]])
+        self.assertEqual({n for _, n in seen}, {len(self.plan["steps"])})
+
+    def test_a_failing_listener_cannot_affect_the_run(self):
+        def boom(e, n):
+            raise RuntimeError("listener died")
+        with NoSocket():
+            run = capp.apply_plan(self.plan, on_step=boom)
+        self.assertEqual(run["counts"]["failed"], 0)
+        self.assertEqual(run["counts"]["created"], len(self.plan["steps"]))
+
+    def test_progress_store_keeps_slim_entries_and_marks_done(self):
+        rid = "run-test-1"
+        server.progress_start(rid, 3)
+        server.progress_step(rid, {"seq": 1, "kind": "client", "method": "POST", "path": "/clients",
+                                   "status": 201, "created_id": "cli_x", "body": {"secret": "no"}})
+        out = server.clone_progress_handler({"run_id": rid})
+        self.assertEqual((out["total"], out["done"], len(out["entries"])), (3, False, 1))
+        self.assertNotIn("body", out["entries"][0])
+        self.assertEqual(out["entries"][0]["created_id"], "cli_x")
+        server.progress_finish(rid)
+        self.assertTrue(server.clone_progress_handler({"run_id": rid})["done"])
+
+    def test_unknown_run_id_is_an_error_not_an_empty_run(self):
+        self.assertIn("error", server.clone_progress_handler({"run_id": "nope"}))
+        self.assertIn("error", server.clone_progress_handler({}))
+
+    def test_live_apply_handler_wires_progress_under_the_pages_run_id(self):
+        # The page picks run_id and polls it while the request is in flight; the handler
+        # must register it BEFORE apply_plan starts and mark it done after — even on error.
+        def fake_apply(plan, **kw):
+            kw["on_step"]({"seq": 1, "kind": "client", "method": "POST", "path": "/clients",
+                           "status": 201, "body": {"x": 1}}, len(plan["steps"]))
+            # mid-run: the page's poll must already see the step
+            mid = server.clone_progress_handler({"run_id": "run-page-7"})
+            self.assertEqual((mid["done"], len(mid["entries"])), (False, 1))
+            return {"counts": {}, "journal": [], "dry_run": False, "problems": [], "flags": [],
+                    "created_objects": [], "elapsed_seconds": 0}
+        with mock.patch.object(server.capp, "apply_plan", side_effect=fake_apply), \
+             mock.patch.object(server.capp, "render_run", return_value=""), \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()):
+            out = server.clone_apply_handler({"plan": self.plan, "dry_run": False,
+                                              "confirm": "CLONE", "cat_token": "t",
+                                              "run_id": "run-page-7"})
+        self.assertEqual(out["run_id"], "run-page-7")
+        after = server.clone_progress_handler({"run_id": "run-page-7"})
+        self.assertTrue(after["done"])
+        self.assertEqual(len(after["entries"]), 1)
+        self.assertNotIn("body", after["entries"][0])
+
+    def test_progress_is_marked_done_even_when_apply_raises(self):
+        with mock.patch.object(server.capp, "apply_plan", side_effect=RuntimeError("cat down")), \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()):
+            with self.assertRaises(RuntimeError):
+                server.clone_apply_handler({"plan": self.plan, "dry_run": False,
+                                            "confirm": "CLONE", "cat_token": "t",
+                                            "run_id": "run-page-8"})
+        self.assertTrue(server.clone_progress_handler({"run_id": "run-page-8"})["done"])
+
+    def test_the_server_class_is_threaded_so_polls_are_answered_mid_run(self):
+        import socketserver
+        self.assertTrue(issubclass(server.Server, socketserver.ThreadingMixIn))
 
 
 class TestSandboxKeys(unittest.TestCase):

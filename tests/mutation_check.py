@@ -400,8 +400,8 @@ MUTATIONS = [
      '    if acquirer and acquirer in (cur.get("by_acquirer") or {}):',
      '    if False:'),
     ("unavailable validation is silent", "app/clone_capture.py",
-     '    elif cur_cfg.get("unavailable"):',
-     '    elif False:'),
+     '        if gating:\n            flag(make_flag(\n                "currency_validation_unavailable",',
+     '        if False:\n            flag(make_flag(\n                "currency_validation_unavailable",'),
     ("a capture with no validity data is not flagged", "app/clone_capture.py",
      '    if cur_cfg is None:',
      '    if False:'),
@@ -505,6 +505,25 @@ MUTATIONS = [
     ("scope list ignored — every entity captured regardless of ticks", "app/clone_capture.py",
      '    kept = [e for e in ents if e.get("id") in wanted_set]',
      '    kept = list(ents)'),
+
+    # -- only the lists that gate something may raise the validation warning ----
+    ("payout-routes 400 flagged as unchecked validity again", "app/clone_capture.py",
+     '                  if not u.startswith("/payout-routes/configuration")]',
+     '                  ]'),
+
+    # -- the always-on manual steps must reach every handover -------------------
+    ("RTAU manual step silently dropped from the plan", "app/clone_capture.py",
+     '    flag(make_flag("rtau_manual",',
+     '    _ = (make_flag("rtau_manual",'),
+
+    # -- live progress: the page must be told about every step, and told the truth --
+    ("progress listener never told about a step", "app/clone_apply.py",
+     '                on_step(entry, total_steps)',
+     '                pass'),
+    ("progress marked done only on success (a crash leaves the page polling forever)",
+     "app/server.py",
+     '    finally:\n        progress_finish(run_id)',
+     '        progress_finish(run_id)\n    finally:\n        pass'),
 
     # -- sandbox API keys: sandbox-only, and never a silent fallback to CAT ------
     ("a production API key accepted as a sandbox key", "app/server.py",

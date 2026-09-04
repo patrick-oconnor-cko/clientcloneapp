@@ -40,11 +40,23 @@
   code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
   /* staged flow */
   .stages{display:flex;gap:8px;margin:6px 0 18px;flex-wrap:wrap}
-  .stage{flex:1;min-width:180px;padding:10px 12px;border:1px solid var(--edge);border-radius:9px;background:var(--panel)}
+  /* the stage cards are buttons: each opens its own page in the main area */
+  .stage{flex:1;min-width:180px;padding:10px 12px;border:1px solid var(--edge);border-radius:9px;background:var(--panel);
+         text-align:left;color:var(--fg);font:inherit;cursor:pointer}
+  .stage:hover:not(:disabled){background:var(--panel2)}
+  .stage:disabled{opacity:.45;cursor:not-allowed}
   .stage .n{font-size:11px;color:var(--mut);letter-spacing:.5px;text-transform:uppercase}
   .stage .t{font-weight:600;margin:2px 0 4px}
   .stage .s{font-size:11.5px;color:var(--mut)}
   .stage.active{border-color:var(--accent)} .stage.done{border-color:#265b34}
+  .stage.sel{background:var(--panel2);box-shadow:0 0 0 2px var(--accent) inset}
+  /* live apply progress */
+  .bar{height:9px;background:#0d0f14;border:1px solid var(--edge);border-radius:6px;overflow:hidden;margin:8px 0 6px}
+  .bar i{display:block;height:100%;background:var(--accent);transition:width .4s}
+  .bar.fail i{background:var(--err)} .bar.ok i{background:var(--ok)}
+  .steplog{font:11.5px ui-monospace,Menlo,monospace;max-height:220px;overflow:auto;background:var(--panel);
+           border:1px solid var(--edge);border-radius:9px;padding:8px 12px;margin:6px 0 10px}
+  .steplog div{padding:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .banner{border:1px solid #5b4a20;background:#221d10;color:#e8d9a8;border-radius:9px;padding:11px 13px;font-size:12.5px;margin-bottom:14px}
   .banner.stop{border-color:#5b2626;background:#211010;color:#f0b4b0}
   .banner ol.warnlist{margin:10px 0 2px;padding-left:26px}
@@ -135,13 +147,49 @@ function fmtDur(ms){const s=ms/1000;
   if(s<10)return s.toFixed(1)+"s"; if(s<60)return Math.round(s)+"s";
   const m=Math.floor(s/60),r=Math.round(s%60); return r?`${m}m ${r}s`:`${m}m`;}
 
-const STAGES=[["Capture","read source config"],["Plan","ordered call list"],["Apply","create in target"]];
+// ---- stage tabs -----------------------------------------------------------------
+// The three stage cards are buttons, each opening its own page in the main area:
+//   Capture  warnings · what was fetched · what will (and will not) be created
+//   Plan     warnings · every endpoint that will be hit · dry run · what cleanup could undo
+//   Apply    warnings · live apply · progress · results · clean up + verify
+// Plan and Apply unlock once a capture exists. Sub-areas (dry run output, live run output,
+// verify and cleanup output) are kept in PANES so switching tabs never loses them.
+const STAGES=[["Capture","summary of the source"],["Plan","endpoints · dry run · undo"],["Apply","live run · results · clean up"]];
+const INTRO=$("view").innerHTML;         // the how-it-works page, shown until a capture exists
+let TAB=0;                               // which stage page is showing
+let CAPINFO=null;                        // {calls, capture_path, el} from the last capture
+let DRYRUN=null;                         // last dry-run result (Plan page)
+const PANES={dryview:"",runview:"",verifyview:"",cleanview:""};
+function pane(id,html){PANES[id]=html; const el=$(id); if(el) el.innerHTML=html;}
 function drawStages(){
   $("stages").innerHTML=STAGES.map((s,i)=>{
-    const n=i+1, cls=STAGE>n-1?"done":(STAGE===n-1?"active":"");
-    const mark=STAGE>n-1?'<span class="ok">✓ done</span>':(STAGE===n-1?'<span class="warn">next</span>':'<span class="mut">waiting</span>');
-    return `<div class="stage ${cls}"><div class="n">Stage ${n}</div><div class="t">${s[0]}</div>
-            <div class="s">${s[1]} · ${mark}</div></div>`;}).join("");
+    const n=i+1, done=STAGE>n-1, enabled=i===0||!!PLAN;
+    const cls=(done?"done ":"")+(STAGE===n-1?"active ":"")+(TAB===i?"sel":"");
+    const mark=done?'<span class="ok">✓ done</span>':(STAGE===n-1?'<span class="warn">next</span>':'<span class="mut">waiting</span>');
+    return `<button type="button" class="stage ${cls}" data-tab="${i}" ${enabled?"":"disabled"}
+      title="${enabled?'Open the '+s[0]+' page':'Capture a source client first'}">
+      <div class="n">Stage ${n}</div><div class="t">${s[0]}</div>
+      <div class="s">${s[1]} · ${mark}</div></button>`;}).join("");
+  $("stages").querySelectorAll("button.stage").forEach(b=>{b.onclick=()=>showTab(+b.dataset.tab);});
+}
+function snapshotPanes(){
+  // Sub-areas are written directly by the verify/cleanup code; capture them before the
+  // page is rebuilt so nothing is lost on a tab switch.
+  for(const id of Object.keys(PANES)){ const el=$(id); if(el) PANES[id]=el.innerHTML; }
+}
+function showTab(i){
+  snapshotPanes();
+  TAB=i; drawStages();
+  if(!PLAN){ $("view").innerHTML=INTRO; return; }
+  [renderCaptureTab,renderPlanTab,renderApplyTab][i]();
+  for(const id of Object.keys(PANES)){ const el=$(id); if(el) el.innerHTML=PANES[id]; }
+  wireConfirm("confirmbox","applybtn","CLONE");
+  wireConfirm("cleanconfirm","cleanbtn","CLEANUP");
+  window.scrollTo({top:0});
+}
+function wireConfirm(boxId,btnId,word){
+  const cb=$(boxId), btn=$(btnId);
+  if(cb&&btn) cb.oninput=()=>{btn.disabled=cb.value.trim()!==word;};
 }
 
 async function post(path,body){
@@ -222,6 +270,8 @@ const FLAG_LABELS={
   compass_settings_not_captured:"Compass settings not captured",
   flow_account_not_captured:"Flow account not captured",
   network_tokens_manual:"Network tokens — manual step",
+  rtau_manual:"RTAU — manual step",
+  intelligent_acceptance_manual:"Intelligent Acceptance — manual step",
   network_tokens_not_captured:"Network tokens not captured",
   network_tokens_default_entity_not_in_scope:"Network tokens — entity out of scope",
   network_tokens_default_entity_unreadable:"Network tokens unreadable",
@@ -234,7 +284,7 @@ const ACTION_PILLS={
   carried:'<span class="pill warn">source value carried</span>',
   not_checked:'<span class="pill mut">not checked</span>',
 };
-function renderWarnings(warns, flags){
+function renderWarnings(warns, flags, intro){
   if(!warns.length) return "";
   const byMsg=new Map(flags.map(f=>[f.message,f]));
   const items=warns.map(w=>{
@@ -243,9 +293,11 @@ function renderWarnings(warns, flags){
     const pill=f&&ACTION_PILLS[f.action]?" "+ACTION_PILLS[f.action]:"";
     return `<li><b>${esc(label)}</b>${pill}<br>${esc(w)}</li>`;});
   return `<div class="banner"><b>${warns.length} warning${warns.length===1?"":"s"}</b> —
-    review before applying. Each is a finding the plan works around; none stops the run.
+    ${intro||"review before applying. Each is a finding the plan works around; none stops the run."}
     <ol class="warnlist">${items.join("")}</ol></div>`;
 }
+// the same warnings open every stage page, so the operator never loses sight of them
+function planWarnings(){ return renderWarnings(PLAN.warnings||[], PLAN.flags||[]); }
 
 function scopeLabel(){
   if(!ENTITIES||!SCOPE)return "all entities";
@@ -273,7 +325,11 @@ async function capture(){
     const el=fmtDur(performance.now()-t0);
     if(code===501){ notImplemented(j,el); return; }
     if(j.error){ $("status").innerHTML='<span class="err">'+esc(j.error)+'</span> <span class="mut">— after '+el+'</span>'; return; }
-    PLAN=j.plan||null; OUTLOOK=j.cleanup_outlook||null; STAGE=2; drawStages(); renderPlan(j,el);
+    PLAN=j.plan||null; OUTLOOK=j.cleanup_outlook||null;
+    CAPINFO={calls:j.calls,capture_path:j.capture_path,el,problems:j.problems||[]};
+    // a fresh capture invalidates everything derived from the previous one
+    DRYRUN=null; LASTRUN=null; VERIFY=null; for(const k in PANES) PANES[k]="";
+    STAGE=2; showTab(0);
     $("status").innerHTML='<span class="ok">Captured</span> <span class="mut">· '+el+'</span>';
   }catch(e){ $("status").innerHTML='<span class="err">'+esc(e)+'</span>'; }
   finally{ $("capture").disabled=false; }
@@ -366,16 +422,24 @@ function renderOutlook(o,total){
     <table><tr><th>Object</th><th>Count</th><th>Cleanup can</th><th>Why not</th></tr>
       ${rows(o.deletable,'ok')}${rows(o.deactivatable,'warn')}${rows(o.permanent,'err')}
     </table>
-    <p class="mut">Cleanup runs after an apply — a <b>Clean up this run</b> button appears
-      with the results, previews what it would do, and needs a separate confirmation.</p>`;
+    <p class="mut">These are the delete and deactivate steps that will be available on the
+      <b>Apply</b> page once a run has happened. Cleanup previews first and needs its own
+      confirmation.</p>`;
 }
 
-function renderPlan(j,el){
-  const steps=(PLAN&&PLAN.steps)||[];
+function planHeader(){
+  const steps=PLAN.steps||[], ents=[...new Set(steps.filter(s=>s.entity).map(s=>s.entity))];
+  return `<h2>${esc(PLAN.target.client_name||"Clone")}
+      <span class="mut">— ${steps.length} calls · ${ents.length} entities · from
+      ${esc(PLAN.source.client_name||PLAN.source.client_id)}</span></h2>
+    <p class="mut">Scope: <b>${esc(scopeLabel())}</b></p>`;
+}
+
+// what the plan will create: entity -> kind -> steps; processors nest under their channel
+function buildTree(){
+  const steps=PLAN.steps||[];
   const ents=[...new Set(steps.filter(s=>s.entity).map(s=>s.entity))];
   const bySeq=s=>s.seq;
-
-  // group: entity -> kind -> steps ; processors nest under their channel
   let tree="";
   const clientStep=steps.find(s=>s.kind==="client");
   if(clientStep){
@@ -413,44 +477,122 @@ function renderPlan(j,el){
       tree+=`</table>`;
     });
   });
+  return tree;
+}
 
-  const skipped=(PLAN.skipped||[]), warns=(PLAN.warnings||[]);
-  $("view").innerHTML=`
-    <div class="banner">Plan built from the source config. <b>Nothing has been created.</b>
-      Everything below is what <i>would</i> be created, in order.</div>
-    <h2>${esc(PLAN.target.client_name||"Clone")}
-      <span class="mut">— ${steps.length} calls · ${ents.length} entities · from
-      ${esc(PLAN.source.client_name||PLAN.source.client_id)}</span></h2>
-    <p class="mut">Scope: <b>${esc(scopeLabel())}</b></p>
-    ${renderWarnings(warns, PLAN.flags||[])}
-    ${tree}
-    <h3>Will NOT be created <span class="mut">— ${skipped.length}</span></h3>
+function skippedTable(){
+  const skipped=PLAN.skipped||[];
+  return `<h3>Will NOT be created <span class="mut">— ${skipped.length}</span></h3>
     <table><tr><th>Item</th><th>Why</th></tr>
       ${skipped.map(s=>`<tr><td>${esc(s.kind)}${s.entity?' <span class="mut">'+esc(s.entity)+'</span>':''}</td>
-        <td class="mut">${esc(s.reason)}</td></tr>`).join("")}</table>
-    <div class="toolbar">
+        <td class="mut">${esc(s.reason)}</td></tr>`).join("")}</table>`;
+}
+function planTools(){
+  return `<div class="toolbar">
       <button onclick="dlPlan()">Download plan (.json)</button>
       <button onclick="copyPlan()">Copy plan</button>
     </div>
     <details><summary class="mut" style="cursor:pointer;margin:8px 0">Raw plan JSON</summary>
-      <pre id="plantext">${esc(JSON.stringify(PLAN,null,2))}</pre></details>
-    <h3>Stage 3 — Dry run <span class="mut">(safe)</span></h3>
+      <pre id="plantext">${esc(JSON.stringify(PLAN,null,2))}</pre></details>`;
+}
+
+// ---- Stage 1 page: Capture — warnings, what was fetched, what will be created ----
+function renderCaptureTab(){
+  const steps=PLAN.steps||[], ci=CAPINFO||{};
+  const ents=[...new Set(steps.filter(s=>s.entity).map(s=>s.entity))];
+  const kindCounts=Object.entries(steps.reduce((m,s)=>(m[s.kind]=(m[s.kind]||0)+1,m),{}));
+  // validate_plan mirrors the warnings as "warning: …"; only anything else is news here
+  const problems=(ci.problems||[]).filter(p=>!/^warning:/i.test(p));
+  $("view").innerHTML=`
+    <div class="banner">Source captured and plan built. <b>Nothing has been created.</b>
+      Open <b>Plan</b> for the endpoints and a dry run, <b>Apply</b> to create.</div>
+    ${planHeader()}
+    ${planWarnings()}
+    <h3>What was fetched</h3>
+    <table>
+      <tr><th style="width:200px">Source client</th><td><code>${esc(PLAN.source.client_id)}</code> ${esc(PLAN.source.client_name||"")}</td></tr>
+      <tr><th>Scope</th><td>${esc(scopeLabel())}</td></tr>
+      <tr><th>Entities in the plan</th><td>${ents.length}</td></tr>
+      <tr><th>CAT calls made</th><td>${ci.calls!=null?esc(ci.calls):"—"} <span class="mut">read-only GETs · took ${esc(ci.el||"?")}</span></td></tr>
+      <tr><th>Saved capture</th><td><code>${esc(ci.capture_path||"—")}</code></td></tr>
+      <tr><th>Steps planned</th><td>${steps.length} — ${kindCounts.map(([k,n])=>chip(`${KINDLABEL[k]||k} ×${n}`)).join(" ")}</td></tr>
+      <tr><th>Flagged</th><td>${(PLAN.warnings||[]).length} warning(s) · ${(PLAN.skipped||[]).length} item(s) will not be created</td></tr>
+    </table>
+    ${problems.length?`<div class="banner stop"><b>Plan validation</b><br>${problems.map(esc).join("<br>")}</div>`:""}
+    <h3>What will be created</h3>
+    ${buildTree()}
+    ${skippedTable()}
+    ${planTools()}`;
+}
+
+// ---- Stage 2 page: Plan — warnings, endpoints, dry run, what cleanup could undo ----
+function endpointSummary(steps){
+  const g={};
+  steps.forEach(s=>{
+    const tmpl=(s.path||"").replace(/\{\{[^}]*\}\}/g,"{id}");
+    const key=`${s.method} ${tmpl}`;
+    const r=(g[key]=g[key]||{method:s.method,tmpl,n:0,kinds:new Set(),auth:s.auth});
+    r.n++; r.kinds.add(s.kind);
+  });
+  return `<table><tr><th style="width:64px">Method</th><th>Endpoint</th><th style="width:56px">Calls</th><th>For</th></tr>
+    ${Object.values(g).map(r=>`<tr><td><code>${esc(r.method)}</code></td>
+      <td><code>${esc(r.tmpl)}</code>${r.auth&&r.auth!=="cat"?' <span class="pill warn">sandbox API</span>':''}</td>
+      <td>${r.n}</td><td class="mut">${[...r.kinds].map(k=>esc(KINDLABEL[k]||k)).join(", ")}</td></tr>`).join("")}</table>`;
+}
+function renderPlanTab(){
+  const steps=PLAN.steps||[];
+  $("view").innerHTML=`
+    <div class="banner">Every call the apply will make, in order. <b>Nothing has been created.</b>
+      Dry-run it here; create it on the <b>Apply</b> page.</div>
+    ${planHeader()}
+    ${planWarnings()}
+    <h3>Endpoints that will be hit <span class="mut">— ${steps.length} calls</span></h3>
+    <p class="mut">Grouped by endpoint. <code>{id}</code> stands for an id minted earlier in the same run.</p>
+    ${endpointSummary(steps)}
+    <details><summary class="mut" style="cursor:pointer;margin:8px 0">All ${steps.length} calls in order</summary>
+      <table><tr><th style="width:44px">#</th><th>Kind</th><th>Name</th><th>Call</th></tr>
+        ${steps.map(s=>`<tr><td>${s.seq}</td><td>${esc(KINDLABEL[s.kind]||s.kind)}</td><td>${esc(s.label||"—")}</td>
+          <td><code>${esc(s.method)} ${esc(s.path)}</code>${s.optional?' <span class="pill mut">optional</span>':''}${s.verify?' <span class="pill mut">read-back check</span>':''}</td></tr>`).join("")}</table>
+    </details>
+    ${planTools()}
+    <h3>Dry run <span class="mut">(safe)</span></h3>
     <p class="mut">Resolves every id placeholder against a synthetic id map and prints the
       exact calls that <i>would</i> be sent. No sockets are opened, nothing is created.</p>
     <div class="toolbar"><button onclick="dryRun()">Dry run — resolve all ${steps.length} calls</button></div>
-    <div id="runview"></div>
-    ${renderOutlook(OUTLOOK,steps.length)}
+    <div id="dryview"></div>
+    ${renderOutlook(OUTLOOK,steps.length)}`;
+}
+
+// ---- Stage 3 page: Apply — warnings, live apply, progress, results, clean up ----
+function renderApplyTab(){
+  const steps=PLAN.steps||[], warns=PLAN.warnings||[], skipped=PLAN.skipped||[];
+  const applied=!!(LASTRUN&&!LASTRUN.dry_run&&LASTRUN.counts&&LASTRUN.counts.failed===0);
+  const hasObjs=!!(LASTRUN&&(LASTRUN.created_objects||[]).length);
+  $("view").innerHTML=`
+    ${planHeader()}
+    ${planWarnings()}
     <div class="confirm">
-      <b class="err">Stage 4 — Live apply.</b> Sends ${steps.length} POSTs and creates real
-      objects in <b>sandbox</b>. If a step fails the run stops there; everything created
-      before it remains. Each run is journalled to <code>clone-runs/</code>.
+      <b class="err">Live apply.</b> Sends ${steps.length} calls and creates real objects in
+      <b>sandbox</b>. If a step fails the run stops there; everything created before it
+      remains. Each run is journalled to <code>clone-runs/</code>.
       ${warns.length?`<br><span class="warn">${warns.length} warning(s) above — review first.</span>`:''}
       ${skipped.length?`<br><span class="mut">${skipped.length} item(s) will not be created.</span>`:''}
-      <input type="text" id="confirmbox" placeholder="type CLONE to enable" autocomplete="off"/>
+      ${applied?`<br><span class="ok">This plan has been applied. Re-running would create a second copy.</span>`:''}
+      <input type="text" id="confirmbox" placeholder="type CLONE to enable" autocomplete="off" ${applied?"disabled":""}/>
       <button class="btn danger" id="applybtn" disabled onclick="apply()">Apply plan — create ${steps.length} objects</button>
-    </div>`;
-  const cb=$("confirmbox");
-  cb.oninput=()=>{$("applybtn").disabled=cb.value.trim()!=="CLONE";};
+    </div>
+    <div id="runview"></div>
+    <h3>Clean up</h3>
+    <p class="mut">Reverses a run as far as CAT allows: deletes what can be deleted and sets
+      the rest Inactive. Channels and processors can be neither. Preview first; removal needs
+      <code>CLEANUP</code> typed.</p>
+    <div class="toolbar">
+      <button onclick="cleanupPreview()" ${hasObjs?"":"disabled"}>Preview clean up of this run</button>
+      <button onclick="verifyRun()" ${hasObjs?"":"disabled"}>Verify in CAT (read back) — act per object</button>
+    </div>
+    ${hasObjs?"":'<p class="mut">Available once a live run has created something.</p>'}
+    <div id="verifyview"></div>
+    <div id="cleanview"></div>`;
 }
 
 async function dryRun(){
@@ -461,10 +603,12 @@ async function dryRun(){
   if(j.error){ $("status").innerHTML='<span class="err">'+esc(j.error)+'</span>'; return; }
   const r=j.run, c=r.counts;
   const blocked=r.journal.filter(e=>e.status==="blocked").length;
-  $("status").innerHTML='<span class="ok">Dry run clean</span> <span class="mut">· '+el+'</span>';
-  $("runview").innerHTML=`
+  $("status").innerHTML=(blocked||r.problems.length?'<span class="warn">Dry run has problems</span>'
+                                                    :'<span class="ok">Dry run clean</span>')+' <span class="mut">· '+el+'</span>';
+  DRYRUN=r;
+  pane("dryview",`
     <div class="banner">Dry run — <b>nothing was sent</b>. ${c.created}/${c.steps} steps resolved,
-      ${blocked} blocked by unresolved ids, ${Object.keys(r.id_map).length} id-map entries.</div>
+      ${blocked} blocked, ${Object.keys(r.id_map).length} id-map entries.</div>
     ${r.problems.length?`<div class="banner stop"><b>Problems</b><br>`+
        r.problems.map(esc).join("<br>")+`</div>`:''}
     <table><tr><th>#</th><th>Kind</th><th>Resolved call</th><th>Would create</th></tr>
@@ -473,20 +617,69 @@ async function dryRun(){
       <td><code>${esc(e.method)} ${esc(e.path)}</code>${e.error?'<br><span class="err">'+esc(e.error)+'</span>':''}</td>
       <td>${e.would_create?'<code>'+esc(e.would_create)+'</code>':'<span class="mut">—</span>'}</td>
     </tr>`).join("")}</table>
-    <div class="toolbar"><button onclick="dlRun()">Download run journal (.json)</button></div>`;
-  LASTRUN=r;
+    <div class="toolbar"><button onclick="dlRun(DRYRUN,'clone-dry-run.json')">Download dry-run journal (.json)</button></div>`);
 }
 let LASTRUN=null;
-function dlRun(){if(!LASTRUN)return;
-  const b=new Blob([JSON.stringify(LASTRUN,null,2)],{type:"application/json"});
+function dlRun(run,name){run=run||LASTRUN; if(!run)return;
+  const b=new Blob([JSON.stringify(run,null,2)],{type:"application/json"});
   const a=document.createElement("a");a.href=URL.createObjectURL(b);
-  a.download="clone-dry-run.json";a.click();}
+  a.download=name||"clone-run.json";a.click();}
 
 function showRun(html){
-  // Always report into a dedicated block at the TOP of the results area, then scroll to
-  // it. Writing into runview alone left the report off-screen below the plan.
-  $("runview").innerHTML=html;
-  $("runview").scrollIntoView({behavior:"smooth",block:"start"});
+  // The live run reports into the Apply page's run area. pane() keeps the content even
+  // if the operator is on another tab while the run is in flight.
+  pane("runview",html);
+  const el=$("runview"); if(el) el.scrollIntoView({behavior:"smooth",block:"start"});
+}
+
+const okStatus=e=>typeof e.status==='number'&&e.status<300;
+const stepLine=e=>`<div>${okStatus(e)?'<span class="ok">+</span>':'<span class="err">!</span>'} ${String(e.seq).padStart(3)} ${esc(e.kind)} <span class="mut">${esc(e.method)} ${esc(e.path)}</span> → ${esc(e.status)}${e.error?' <span class="err">'+esc(e.error)+'</span>':''}</div>`;
+
+// Where the run is up to, from /api/clone/progress: each entry is a step the server has
+// already journalled, so this is what has HAPPENED, not an estimate.
+function progressHtml(p,t0){
+  const done=p.entries.length, total=p.total||1, pct=Math.round(100*done/total);
+  const last=p.entries[done-1], failed=p.entries.filter(e=>!okStatus(e)).length;
+  return `<div class="banner"><b>Applying — step ${done} of ${total}</b>
+      <span class="mut">· ${fmtDur(performance.now()-t0)} elapsed${failed?` · <span class="err">${failed} failed</span>`:''}</span>
+    <div class="bar${failed?' fail':''}"><i style="width:${pct}%"></i></div>
+    ${last?`<div class="mut">Last: ${esc(KINDLABEL[last.kind]||last.kind)} — <code>${esc(last.method)} ${esc(last.path)}</code> → ${esc(last.status)}</div>`
+          :'<div class="mut">Waiting for the first step…</div>'}
+    <div class="steplog">${p.entries.slice(-12).map(stepLine).join("")||'<div class="mut">no steps yet</div>'}</div>
+    Do not close this tab. Every step is journalled to <code>clone-runs/</code> as it happens,
+    so even if the tab dies the record survives.</div>`;
+}
+
+function resultHtml(j,r,el){
+  const c=r.counts, ok=c.failed===0, flags=r.flags||[];
+  const objs=r.created_objects||[];
+  return `
+    <div class="banner${ok?'':' stop'}">
+      <b>${ok?'Created all '+c.created+' objects.':'Run stopped after '+c.created+' of '+c.steps+' steps.'}</b>
+      ${c.failed?` ${c.failed} failed, ${c.not_attempted} not attempted.`:''}
+      <span class="mut">· ${esc(el)}</span>
+      <div class="bar ${ok?'ok':'fail'}"><i style="width:${Math.round(100*(c.created+c.failed)/(c.steps||1))}%"></i></div>
+      Journal: <code>${esc(j.journal_path||r.journal_path||'—')}</code>
+      ${ok?'':'<br><span class="err">No rollback. The objects below exist. Use Clean up (below) to remove what CAT allows.</span>'}
+    </div>
+    ${renderWarnings(flags.map(f=>f.message),flags,"findings from the run itself — what could only be learned once the clone existed. Add these to the handover.")}
+    ${r.problems.length?`<div class="banner stop"><b>Problems</b><br>`+r.problems.map(esc).join("<br>")+`</div>`:''}
+    <h3>What was done</h3>
+    <table><tr><th>Steps</th><th>Created</th><th>Failed</th><th>Not attempted</th><th>Time</th></tr>
+      <tr><td>${c.steps}</td><td class="ok">${c.created}</td><td class="${c.failed?'err':''}">${c.failed}</td>
+          <td class="${c.not_attempted?'warn':''}">${c.not_attempted}</td><td>${esc(el)}</td></tr></table>
+    <h3>Created <span class="mut">— ${objs.length}</span></h3>
+    <table><tr><th style="width:44px">#</th><th>Kind</th><th>Name</th><th>New id</th></tr>
+      ${objs.map(o=>`<tr><td>${o.seq}</td><td>${esc(KINDLABEL[o.kind]||o.kind)}</td><td>${esc(o.label||'—')}</td>
+        <td><code>${esc(o.new_id||'—')}</code></td></tr>`).join("")||'<tr><td colspan="4" class="mut">nothing</td></tr>'}</table>
+    <details><summary class="mut" style="cursor:pointer;margin:8px 0">Full journal — ${r.journal.length} entries</summary>
+    <table><tr><th>#</th><th>Kind</th><th>Call</th><th>Status</th></tr>
+      ${r.journal.map(e=>`<tr><td>${e.seq}</td><td>${esc(e.kind)}</td>
+        <td><code>${esc(e.method)} ${esc(e.path)}</code>
+          ${e.error?'<br><span class="err">'+esc(e.error)+'</span>':''}</td>
+        <td>${okStatus(e)?'<span class="ok">'+e.status+'</span>':'<span class="err">'+esc(e.status)+'</span>'}</td></tr>`).join("")}</table>
+    </details>
+    <div class="toolbar"><button onclick="dlRun()">Download run journal (.json)</button></div>`;
 }
 
 async function apply(){
@@ -496,19 +689,27 @@ async function apply(){
     $("status").innerHTML='<span class="mut">Apply cancelled — nothing was sent.</span>';
     return;
   }
-  $("applybtn").disabled=true;
+  const ab=$("applybtn"); if(ab) ab.disabled=true;
   $("status").innerHTML='<span class="warn">Applying '+n+' steps — do not close this tab…</span>';
-  showRun(`<div class="banner"><b>Applying ${n} steps…</b><br>
-    Roughly ${Math.ceil(n*0.6)}s at the paced rate. The report appears here when it finishes.
-    Every step is journalled to <code>clone-runs/</code> as it happens, so even if this tab
-    dies the record survives.</div>`);
+  const runId="run-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,8);
   const t0=performance.now();
+  showRun(progressHtml({total:n,entries:[]},t0));
+  // Poll the server for where the run is up to while the apply request is in flight. A
+  // poll already in flight when the run finishes must not paint over the final result,
+  // hence the `finished` guard as well as clearInterval.
+  let finished=false;
+  const poll=setInterval(async()=>{
+    try{ const {body:p}=await post("/api/clone/progress",{run_id:runId});
+         if(!finished&&p&&!p.error) pane("runview",progressHtml(p,t0)); }catch(e){}
+  },1000);
+  const stopPolling=()=>{finished=true; clearInterval(poll);};
   let j, code;
   try{
     ({code,body:j}=await post("/api/clone/apply",
       {plan:PLAN,...creds(),dry_run:false,confirm:"CLONE",
-       manual_values:MANUAL}));
+       manual_values:MANUAL,run_id:runId}));
   }catch(e){
+    stopPolling();
     // network died / non-JSON response / token expired mid-run. Objects may still have
     // been created, so point at the journal rather than implying nothing happened.
     $("status").innerHTML='<span class="err">Request failed</span>';
@@ -516,9 +717,10 @@ async function apply(){
       This does <b>not</b> mean nothing was created — the server may have written objects
       before the connection broke. Check the newest file in <code>clone-runs/</code> for
       the authoritative record.</div>`);
-    $("applybtn").disabled=false;
+    if($("applybtn")) $("applybtn").disabled=false;
     return;
   }
+  stopPolling();
   const el=fmtDur(performance.now()-t0);
   if(!j || j.error){
     $("status").innerHTML='<span class="err">'+esc((j&&j.error)||"empty response")+
@@ -526,41 +728,22 @@ async function apply(){
     showRun(`<div class="banner stop"><b>${esc((j&&j.error)||"Empty response from server")}</b><br>
       ${esc((j&&j.detail)||"")}<br>HTTP ${esc(code)}. Nothing was created unless a journal
       exists in <code>clone-runs/</code>.</div>`);
-    $("applybtn").disabled=false;
+    if($("applybtn")) $("applybtn").disabled=false;
     return;
   }
   const r=j.run, c=r.counts, ok=c.failed===0;
-  STAGE=3; drawStages(); LASTRUN=r;
+  STAGE=3; LASTRUN=r; VERIFY=null;
   $("status").innerHTML=(ok?'<span class="ok">Clone complete</span>'
                           :'<span class="err">Stopped on failure</span>')+
                         ' <span class="mut">· '+el+'</span>';
-  showRun(`
-    <div class="banner${ok?'':' stop'}">
-      <b>${ok?'Created all '+c.created+' objects.':'Run stopped after '+c.created+' of '+c.steps+' steps.'}</b>
-      ${c.failed?` ${c.failed} failed, ${c.not_attempted} not attempted.`:''}
-      <br>Journal: <code>${esc(j.journal_path||r.journal_path||'—')}</code>
-      ${ok?'':'<br><span class="err">No rollback. The objects below exist. Use Clean up to remove what CAT allows.</span>'}
-    </div>
-    <div class="toolbar">
-      <button onclick="cleanupPreview()">Clean up this run — preview</button>
-    </div>
-    <div id="cleanview"></div>
-    ${r.problems.length?`<div class="banner stop"><b>Problems</b><br>`+
-       r.problems.map(esc).join("<br>")+`</div>`:''}
-    <h3>Created <span class="mut">— ${(r.created_objects||[]).length}</span></h3>
-    <div class="toolbar"><button onclick="verifyRun()">Verify in CAT (read back)</button></div>
-    <div id="verifyview"><p class="mut">Read back each object from CAT to confirm what
-      actually exists, then remove or deactivate individually.</p></div>
-    <h3>Full journal</h3>
-    <table><tr><th>#</th><th>Kind</th><th>Call</th><th>Status</th></tr>
-      ${r.journal.map(e=>`<tr><td>${e.seq}</td><td>${esc(e.kind)}</td>
-        <td><code>${esc(e.method)} ${esc(e.path)}</code>
-          ${e.error?'<br><span class="err">'+esc(e.error)+'</span>':''}</td>
-        <td>${typeof e.status==='number'&&e.status<300?'<span class="ok">'+e.status+'</span>'
-             :'<span class="err">'+esc(e.status)+'</span>'}</td></tr>`).join("")}</table>
-    <div class="toolbar"><button onclick="dlRun()">Download run journal (.json)</button></div>`);
-  // leave Apply disabled on success: re-running would create a second copy
-  $("applybtn").disabled = ok;
+  // Re-render the Apply page FIRST (showTab snapshots the sub-areas as they are, so writing
+  // the result before it would be undone by the snapshot): the confirm box locks after
+  // success — a re-run would create a second copy — and the clean-up tools unlock now that
+  // something exists. Then write the result and reset the per-run verify/cleanup areas.
+  showTab(2);
+  pane("runview",resultHtml(j,r,el));
+  pane("verifyview",""); pane("cleanview","");
+  const rv=$("runview"); if(rv) rv.scrollIntoView({behavior:"smooth",block:"start"});
 }
 // hand-supplied values for fields capture cannot read (see task: manual entry UI)
 const MANUAL={};
@@ -622,10 +805,8 @@ function drawVerify(){
       Untick anything you want to keep. Type <code>CLEANUP</code> to enable.
       <input type="text" id="cleanconfirm" placeholder="type CLEANUP to enable" autocomplete="off"/>
       <button class="btn danger" id="cleanbtn" disabled onclick="cleanupSelected()">Remove selected</button>
-    </div>`:'<p class="mut">Nothing here can be removed or deactivated via the API.</p>'}
-    <div id="cleanview"></div>`;
-  const cb=$("cleanconfirm");
-  if(cb) cb.oninput=()=>{$("cleanbtn").disabled=cb.value.trim()!=="CLEANUP";};
+    </div>`:'<p class="mut">Nothing here can be removed or deactivated via the API.</p>'}`;
+  wireConfirm("cleanconfirm","cleanbtn","CLEANUP");
 }
 
 // Single-object undo, straight from the row button. The confirm names the exact call,
@@ -775,7 +956,7 @@ if(window.__DEV_CREDS__){const c=window.__DEV_CREDS__;
   if(c.sandbox_pk&&$("sbox_pk"))$("sbox_pk").value=c.sandbox_pk;}
 $("capture").onclick=capture;
 $("loadents").onclick=loadEntities;
-drawStages();
+showTab(0);
 </script>
 </body>
 </html>

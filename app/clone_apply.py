@@ -373,8 +373,12 @@ class Journal:
 
 def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                pace_seconds=0.35, manual_values=None, journal_path=None,
-               sandbox_keys=None):
+               sandbox_keys=None, on_step=None):
     """Execute or simulate a clone plan.
+
+    on_step: optional callable(entry, total_steps), invoked once per step as its journal
+    entry is written — the same entry, same order, same moment. This is how the page shows
+    live progress; a failing callback is swallowed so it can never affect the run.
 
     dry_run=True (the default) opens no sockets at all.
 
@@ -415,6 +419,16 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         "plan_counts": plan.get("counts") or {},
         # WHICH keys were supplied, never their values — the journal is a durable file.
         "sandbox_keys_supplied": sorted(k for k, v in (sandbox_keys or {}).items() if v)})
+    total_steps = len(plan.get("steps", []))
+
+    def record(entry):
+        """Journal an entry (in-memory + crash-safe file) and tell the progress listener."""
+        journal.append(entry); jrn.append(entry)
+        if on_step:
+            try:
+                on_step(entry, total_steps)
+            except Exception:
+                pass
 
     for step in plan.get("steps", []):
         seq, kind = step["seq"], step["kind"]
@@ -446,7 +460,7 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
             entry.update(status="blocked", error=auth_err)
             problems.append(f"step {seq} ({kind}): {auth_err}")
         if miss or auth_err:
-            journal.append(entry); jrn.append(entry); failed += 1
+            record(entry); failed += 1
             if stop_on_error:
                 skipped = len(plan["steps"]) - seq
                 break
@@ -465,7 +479,7 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                 new_id = synth_id(step["provides"], seq)
                 id_map[step["provides"]] = new_id
                 entry["would_create"] = new_id
-            journal.append(entry); jrn.append(entry); created += 1
+            record(entry); created += 1
             continue
 
         t0 = time.time()
@@ -516,7 +530,7 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                                   f"; downstream steps that reference it cannot resolve")
                 problems.append(f"step {seq} ({kind}): {entry['error']}")
                 failed += 1
-                journal.append(entry); jrn.append(entry)
+                record(entry)
                 if stop_on_error:
                     skipped = len(plan["steps"]) - seq
                     break
@@ -558,15 +572,15 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                                 f"{(err or '')[:160]}"}
                 entry["flags"] = [f]
                 run_flags.append(f)
-                journal.append(entry); jrn.append(entry)
+                record(entry)
                 continue
             problems.append(f"step {seq} ({kind}): HTTP {code} {(err or '')[:120]}")
-            journal.append(entry); jrn.append(entry)
+            record(entry)
             if stop_on_error:
                 skipped = len(plan["steps"]) - seq
                 break
             continue
-        journal.append(entry); jrn.append(entry)
+        record(entry)
         time.sleep(pace_seconds)
 
     jrn.append({"_footer": {"created": created, "failed": failed,
