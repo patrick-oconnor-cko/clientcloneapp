@@ -280,7 +280,7 @@ MUTATIONS = [
      '    elif False:'),
     ("response excerpt not journalled for id-less writes", "app/clone_apply.py",
      '        if not step.get("provides") and resp not in (None, {}):\n'
-     '            entry["response_excerpt"] = json.dumps(resp)[:1500]',
+     '            entry["response_excerpt"] = json.dumps(redact_secrets(resp))[:1500]',
      '        pass'),
 
     ("network tokens manual flag silently dropped", "app/clone_capture.py",
@@ -308,8 +308,8 @@ MUTATIONS = [
      '        elif False:'),
     ("network tokens moved back before the entities", "app/clone_capture.py",
      '    _network_tokens_steps()\n\n'
-     '    # not attempted in this pass',
-     '    # not attempted in this pass'),
+     '    def _api_key_steps():',
+     '    def _api_key_steps():'),
 
     # -- journal auditability + optional steps ----------------------------------
     ("journal header drops the plan's flags", "app/clone_apply.py",
@@ -515,6 +515,37 @@ MUTATIONS = [
     ("RTAU manual step silently dropped from the plan", "app/clone_capture.py",
      '    flag(make_flag("rtau_manual",',
      '    _ = (make_flag("rtau_manual",'),
+
+    # -- webhooks: source ids remapped, destination key only, out-of-scope refused ----
+    ("webhook condition sends the SOURCE entity/channel ids", "app/clone_capture.py",
+     '            c[field] = [ph(s) for s in kept]',
+     '            c[field] = list(kept)'),
+    ("webhook step sent with the CAT token (auth dropped)", "app/clone_capture.py",
+     '                op="Workflows_Add", notes=notes, label=name, optional=True,\n'
+     '                auth="sandbox_secret")',
+     '                op="Workflows_Add", notes=notes, label=name, optional=True)'),
+    ("a workflow scoped only outside the capture is created anyway", "app/clone_capture.py",
+     '            if not kept:\n                emptied = emptied or c.get("type")',
+     '            if False:\n                emptied = emptied or c.get("type")'),
+    ("a blocked optional step halts the whole run", "app/clone_apply.py",
+     '        if auth_err and not miss and step.get("optional"):',
+     '        if False:'),
+
+    # -- destination API keys: decrypted in-run, used for webhooks, never journalled -----
+    ("minted secret key not fed to the sandbox-API steps", "app/clone_apply.py",
+     '                    if role == "sandbox_secret" and not sandbox_keys.get("sandbox_secret"):\n'
+     '                        sandbox_keys["sandbox_secret"] = value',
+     '                    if False:\n'
+     '                        sandbox_keys["sandbox_secret"] = value'),
+    ("ciphertext journalled in the response excerpt", "app/clone_apply.py",
+     '            entry["response_excerpt"] = json.dumps(redact_secrets(resp))[:1500]',
+     '            entry["response_excerpt"] = json.dumps(resp)[:1500]'),
+    ("real PEM replaced by the dry-run stand-in on a live run", "app/clone_apply.py",
+     '            body["key"] = keypair.public_pem if keypair else DRY_RUN_PEM',
+     '            body["key"] = DRY_RUN_PEM'),
+    ("API key steps emitted without the scope catalogue", "app/clone_capture.py",
+     '        scopes = cap.get("api_key_scopes")\n        if not scopes:',
+     '        scopes = cap.get("api_key_scopes") or {"secret": [], "public": []}\n        if False:'),
 
     # -- live progress: the page must be told about every step, and told the truth --
     ("progress listener never told about a step", "app/clone_apply.py",

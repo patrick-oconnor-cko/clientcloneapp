@@ -55,6 +55,35 @@ def unresolved(*objs):
 # confirm gate, and a plan must never be able to destroy anything.
 ALLOWED_METHODS = {"GET", "POST", "PUT"}
 
+import clone_keys   # RSA key material for the destination's API keys — stdlib only
+
+# The destination's API keys are minted inside the run (see clone_capture's "API keys"
+# block for the CAT contract). The public-crypto-key step gets the run's PEM substituted for
+# PUBLIC_KEY_PEM_PLACEHOLDER; the two token steps return an RSA-encrypted temporary_secret
+# that is decrypted here with the private half, which lives only in this process for the
+# duration of the run. The plaintext goes into run["destination_keys"] (returned to the page
+# and shown once) and, for the secret key, straight into sandbox_keys["sandbox_secret"] so
+# the webhook steps that follow use it. It is NEVER journalled: response excerpts are
+# redacted and the journal entry records only the key's prefix.
+PUBLIC_KEY_PEM_MARKER = "<<RUN_PUBLIC_KEY_PEM>>"      # same literal as clone_capture's
+PUBLIC_CRYPTO_KEY_STEP = "client_public_crypto_key"
+API_KEY_STEPS = {"client_api_secret_key": "sandbox_secret",
+                 "client_api_public_key": "sandbox_public"}
+SECRET_RESPONSE_FIELDS = ("temporary_secret", "secret")
+DRY_RUN_PEM = ("-----BEGIN RSA PUBLIC KEY-----\n(generated at live apply; never in a plan)\n"
+               "-----END RSA PUBLIC KEY-----\n")
+
+
+def redact_secrets(obj):
+    """Copy of a response with any secret-bearing field replaced, for journalling."""
+    if isinstance(obj, dict):
+        return {k: ("REDACTED" if k in SECRET_RESPONSE_FIELDS and isinstance(v, str)
+                    else redact_secrets(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_secrets(x) for x in obj]
+    return obj
+
+
 # Where a step's bearer comes from. Every step is a CAT call unless it says otherwise. A
 # step that targets the Checkout sandbox API declares auth="sandbox_secret" (or
 # "sandbox_public" for the few tokenisation endpoints that take a public key) and is then
@@ -64,7 +93,7 @@ ALLOWED_METHODS = {"GET", "POST", "PUT"}
 SANDBOX_API_BASE = "https://api.sandbox.checkout.com"
 AUTH_MODES = {"cat", "sandbox_secret", "sandbox_public"}
 SANDBOX_KEY_PREFIX = {"sandbox_secret": "sk_sbox_", "sandbox_public": "pk_sbox_"}
-SANDBOX_KEY_LABEL = {"sandbox_secret": "Sandbox Secret Key",
+SANDBOX_KEY_LABEL = {"sandbox_secret": "Destination Sandbox Secret Key",
                      "sandbox_public": "Sandbox Public Key"}
 
 
@@ -325,7 +354,28 @@ def verify_network_tokens(expected, resp):
     return flags, summary
 
 
+def verify_workflows(expected, resp):
+    """Compare the webhook workflows the plan created (by name) with what the clone's
+    sandbox API lists. GET /workflows is a bare {"data": [...]}. A name the plan created
+    that the clone does not list is flagged; extra workflows on the clone are noted only.
+
+    Returns (flags, summary).
+    """
+    items = resp.get("data") if isinstance(resp, dict) else resp
+    have = [w.get("name") for w in (items or []) if isinstance(w, dict)]
+    missing = [n for n in (expected or []) if n not in have]
+    flags = [{"code": "webhook_missing_on_clone", "kind": "webhook_workflow", "name": n,
+              "action": "not_created",
+              "message": f"webhook workflow '{n}' was created by the run but is not "
+                         f"listed on the clone when read back — check the destination "
+                         f"key belongs to the new client"}
+             for n in missing]
+    return flags, {"expected": len(expected or []), "found": len(expected or []) - len(missing),
+                   "missing": missing, "on_clone": len(have)}
+
+
 VERIFIERS = {"payout_routes": verify_payout_routes,
+             "workflows": verify_workflows,
              "compass_settings": verify_compass_settings,
              "network_tokens": verify_network_tokens}
 
@@ -405,6 +455,11 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
     run_flags = []
     created, failed, skipped = 0, 0, 0
     manual_values = manual_values or {}
+    # Our own copy: the run may ADD the destination's freshly minted secret key to it so
+    # later sandbox-API steps authenticate without the operator pasting anything.
+    sandbox_keys = dict(sandbox_keys or {})
+    keypair = None            # the run's RSA keypair, generated when the crypto-key step runs
+    destination_keys = {}     # role -> {kind, id, description, value, padding}; shown once
     t_start = time.time()
     jrn = Journal(journal_path, {
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -442,6 +497,13 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
 
         path = substitute(step["path"], id_map)
         body = substitute(body, id_map)
+        if kind == PUBLIC_CRYPTO_KEY_STEP and body.get("key") == PUBLIC_KEY_PEM_MARKER:
+            # Generate the run's keypair now (live) and put its public half where the
+            # plan left the marker. A dry run gets a stand-in. The id map never holds key
+            # material, and the plan document carries none in either direction.
+            if not dry_run and keypair is None:
+                keypair = clone_keys.generate()
+            body["key"] = keypair.public_pem if keypair else DRY_RUN_PEM
 
         miss = unresolved(path, body)
         entry = {"seq": seq, "kind": kind, "op": step.get("op"),
@@ -459,6 +521,18 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         elif auth_err:
             entry.update(status="blocked", error=auth_err)
             problems.append(f"step {seq} ({kind}): {auth_err}")
+        if auth_err and not miss and step.get("optional"):
+            # An OPTIONAL sandbox-API step whose key was not supplied (webhooks without
+            # the destination secret key) is a finding for the report, not a reason to
+            # abandon the CAT clone. Same treatment as an optional live failure below.
+            f = {"code": "optional_step_blocked", "kind": kind, "seq": seq,
+                 "entity": step.get("entity"), "error": auth_err, "action": "not_created",
+                 "message": f"step {seq} ({kind}) was not sent — {auth_err}. It is "
+                            f"optional, so the run continued."}
+            entry["flags"] = [f]
+            run_flags.append(f)
+            record(entry); failed += 1
+            continue
         if miss or auth_err:
             record(entry); failed += 1
             if stop_on_error:
@@ -514,7 +588,7 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         # with the body. A 201 that persisted nowhere useful looked identical to success
         # until this was journalled.
         if not step.get("provides") and resp not in (None, {}):
-            entry["response_excerpt"] = json.dumps(resp)[:1500]
+            entry["response_excerpt"] = json.dumps(redact_secrets(resp))[:1500]
         writes = method.upper() != "GET"
         if 200 <= code < 300:
             new_id = dig(resp, step["provides_from"]) if step.get("provides_from") \
@@ -536,6 +610,36 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                     break
                 continue
             created += 1
+            if kind in API_KEY_STEPS:
+                # Decrypt the minted key with the run's private half. Success feeds the
+                # secret key to the sandbox-API steps that follow (unless the operator
+                # pasted one) and records only the prefix here; failure is a flag.
+                role = API_KEY_STEPS[kind]
+                ct = next((resp.get(f) for f in SECRET_RESPONSE_FIELDS
+                           if isinstance(resp.get(f), str) and resp.get(f)), None)
+                try:
+                    if keypair is None:
+                        raise ValueError("no keypair — the public-crypto-key step did not run")
+                    if not ct:
+                        raise ValueError("response carried no temporary_secret")
+                    value, padding = keypair.decrypt(ct)
+                    destination_keys[role] = {"kind": kind, "id": new_id,
+                                              "description": body.get("description"),
+                                              "value": value, "padding": padding}
+                    entry["decrypted"] = {"role": role, "padding": padding,
+                                          "prefix": value[:8]}
+                    if role == "sandbox_secret" and not sandbox_keys.get("sandbox_secret"):
+                        sandbox_keys["sandbox_secret"] = value
+                        entry["decrypted"]["used_for"] = "sandbox_secret steps in this run"
+                except ValueError as ex:
+                    f = {"code": "api_key_undecryptable", "kind": kind, "seq": seq,
+                         "entity": None, "action": "not_supplied",
+                         "message": f"step {seq} ({kind}): the key was created (id {new_id}) "
+                                    f"but its secret could not be recovered — {ex}. Steps "
+                                    f"needing it will block unless the Destination Sandbox "
+                                    f"Secret Key was pasted."}
+                    entry["flags"] = [f]
+                    run_flags.append(f)
             # A verify step compares the clone with the source now that the clone
             # exists. Differences are flags, never failures — the run continues.
             v = step.get("verify")
@@ -601,6 +705,9 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         "problems": problems,
         "flags": run_flags,
         "elapsed_seconds": round(time.time() - t_start, 2),
+        # The destination's minted API keys, plaintext, for the page to show ONCE. This is
+        # the only place they leave the process; the journal above never has them.
+        "destination_keys": destination_keys,
     }
 
 

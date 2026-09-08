@@ -93,6 +93,27 @@ REMOVAL = {
                               "why": "network tokens were enabled and scheme onboarding "
                                      "started; neither can be undone by API, and the "
                                      "client is deactivated anyway"},
+    # Webhooks live in the Checkout sandbox API, not CAT: DELETE /workflows/{id} exists
+    # but needs the DESTINATION secret key, which cleanup (CAT-token only) does not carry.
+    # Recorded as not removable here rather than half-supported.
+    # The destination's API keys and the crypto key they were encrypted with. DELETE routes
+    # exist for the crypto key (/clients/{client}/public-keys/{id}) but this map has no
+    # client-scoped template and none of it has a known-good live call; the client is
+    # deactivated anyway, which disables its keys.
+    "client_public_crypto_key": {"mode": "none",
+                                 "why": "the run's RSA public key on the clone; the client "
+                                        "is deactivated anyway — delete in CAT if wanted"},
+    "client_api_secret_key":    {"mode": "none",
+                                 "why": "the clone's API secret key; deactivating the client "
+                                        "disables it — delete in CAT if wanted"},
+    "client_api_public_key":    {"mode": "none",
+                                 "why": "the clone's API public key; deactivating the client "
+                                        "disables it — delete in CAT if wanted"},
+    "webhook_workflow":     {"mode": "none",
+                             "why": "a Workflow in the Checkout sandbox API, not CAT — "
+                                    "remove it in Dashboard > Developers > Workflows, or "
+                                    "DELETE /workflows/{id} with the destination secret "
+                                    "key; not attempted by this tool"},
 }
 
 

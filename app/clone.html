@@ -86,8 +86,10 @@
     <input id="src_client" placeholder="cli_..." autocomplete="off"/>
     <label>CAT API key (Bearer token)</label>
     <input id="cat_token" placeholder="eyJ... (Okta bearer)" autocomplete="off"/>
-    <label>Sandbox Secret Key</label>
-    <input id="sbox_sk" type="password" placeholder="sk_sbox_..." autocomplete="off"/>
+    <label>Source Sandbox Secret Key</label>
+    <input id="sbox_sk" type="password" placeholder="sk_sbox_... (reads the source's webhooks)" autocomplete="off"/>
+    <label>Destination Sandbox Secret Key <span class="mut">(optional — minted in the run)</span></label>
+    <input id="dest_sk" type="password" placeholder="sk_sbox_... only if the new client already has keys" autocomplete="off"/>
     <label>Sandbox Public Key</label>
     <input id="sbox_pk" placeholder="pk_sbox_..." autocomplete="off"/>
     <div class="hint">Please ensure you use a fully scoped PK and SK.</div>
@@ -203,8 +205,9 @@ async function post(path,body){
 // sandbox API (the server refuses anything without the sk_sbox_/pk_sbox_ prefix).
 function creds(){
   const c={cat_token:$("cat_token").value.trim()};
-  const sk=$("sbox_sk").value.trim(), pk=$("sbox_pk").value.trim();
-  if(sk)c.sandbox_sk=sk;
+  const sk=$("sbox_sk").value.trim(), dk=$("dest_sk").value.trim(), pk=$("sbox_pk").value.trim();
+  if(sk)c.sandbox_sk=sk;            // SOURCE client's key: reads its webhooks at capture
+  if(dk)c.dest_sandbox_sk=dk;       // DESTINATION client's key: creates them at apply
   if(pk)c.sandbox_pk=pk;
   return c;
 }
@@ -272,6 +275,15 @@ const FLAG_LABELS={
   network_tokens_manual:"Network tokens — manual step",
   rtau_manual:"RTAU — manual step",
   intelligent_acceptance_manual:"Intelligent Acceptance — manual step",
+  api_keys_not_planned:"Destination API keys not created",
+  api_key_undecryptable:"API key secret not recovered",
+  webhooks_not_read:"Webhooks not read",
+  webhooks_unavailable:"Webhooks unavailable",
+  webhook_scope_emptied:"Webhook out of scope",
+  webhook_url_carried:"Webhook URL carried",
+  webhook_missing_on_clone:"Webhook missing on clone",
+  optional_step_blocked:"Optional step not sent",
+  optional_step_failed:"Optional step failed",
   network_tokens_not_captured:"Network tokens not captured",
   network_tokens_default_entity_not_in_scope:"Network tokens — entity out of scope",
   network_tokens_default_entity_unreadable:"Network tokens unreadable",
@@ -357,7 +369,10 @@ const KINDLABEL={entity:"Entity",currency_account:"Currency account",
   processing_profile:"Processing profile",processing_channel:"Processing channel",
   processor:"Processor",sessions_channel:"Sessions layer",
   payment_routing_rule:"Payment routing rule",payout_routing_rule:"Payout routing rule",
-  payout_setting:"Payout instruction",payout_route:"Payout route",client:"Client"};
+  payout_setting:"Payout instruction",payout_route:"Payout route",client:"Client",
+  client_public_crypto_key:"RSA public key (for key delivery)",client_api_secret_key:"API secret key",
+  client_api_public_key:"API public key",
+  webhook_workflow:"Webhook workflow",webhook_check:"Webhook read-back"};
 
 function chip(t,cls){return `<span class="pill ${cls||''}">${esc(t)}</span>`;}
 
@@ -397,6 +412,16 @@ function detailOf(s){
       push("instrument",(b.payment_instrument||{}).instrument_type);
       break;
     case "payout_route": push("corridor",`${b.country_iso3_code||"?"} / ${b.currency_code||"?"}`); break;
+    case "webhook_workflow": {
+      const conds=b.conditions||[], acts=b.actions||[];
+      const ev=conds.find(c=>c.type==="event");
+      if(ev) push("events",Object.values(ev.events||{}).reduce((n,a)=>n+(a||[]).length,0));
+      const ents=conds.find(c=>c.type==="entity"), pcs=conds.find(c=>c.type==="processing_channel");
+      if(ents) push("entities",(ents.entities||[]).length);
+      if(pcs) push("channels",(pcs.processing_channels||[]).length);
+      acts.filter(a=>a.type==="webhook").forEach(a=>push("→",a.url));
+      d.push(b.active===false?'<span class="warn">inactive</span>':'active');
+      break; }
   }
   return d.join(" · ");
 }
@@ -477,7 +502,38 @@ function buildTree(){
       tree+=`</table>`;
     });
   });
+  // client-level: the destination's API keys, minted in the run
+  const keys=steps.filter(s=>s.kind in {client_public_crypto_key:1,client_api_secret_key:1,client_api_public_key:1});
+  if(keys.length){
+    tree+=`<h3>API keys for the new client <span class="mut">— ${keys.length} · minted in the run; shown once after apply</span></h3>
+      <table><tr><th style="width:44px">#</th><th>Name</th><th>Detail</th><th>Notes</th></tr>`;
+    keys.forEach(s=>{
+      const b=s.body||{};
+      tree+=`<tr><td>${s.seq}</td><td><b>${esc(s.label||"—")}</b></td>
+             <td class="mut">${esc(KINDLABEL[s.kind])}${b.scopes?` · ${b.scopes.length} scopes`:''}</td>
+             <td class="mut">${(s.notes||[]).map(n=>esc(n)).join("<br>")||""}</td></tr>`;});
+    tree+=`</table>`;
+  }
+  // client-level, created in the Checkout sandbox API with the destination secret key
+  const hooks=steps.filter(s=>s.kind==="webhook_workflow");
+  if(hooks.length){
+    tree+=`<h3>Webhooks <span class="mut">— ${hooks.length} · sandbox API, sent with the secret key minted above (or the one you paste)</span></h3>
+      <table><tr><th style="width:44px">#</th><th>Name</th><th>Detail</th><th>Notes</th></tr>`;
+    hooks.forEach(s=>{
+      tree+=`<tr><td>${s.seq}</td><td><b>${esc(s.label||"—")}</b></td>
+             <td class="mut">${detailOf(s)}</td>
+             <td class="mut">${(s.notes||[]).map(n=>esc(n)).join("<br>")||""}</td></tr>`;});
+    tree+=`</table>`;
+  }
   return tree;
+}
+function webhooksFetchedLabel(){
+  const n=(PLAN.steps||[]).filter(s=>s.kind==="webhook_workflow").length;
+  const src=PLAN.webhooks_source;
+  if(src==="no_key") return '<span class="warn">not read — no Source Sandbox Secret Key</span>';
+  if(src==="unavailable") return '<span class="err">read failed — check the source key</span>';
+  const total=PLAN.webhooks_read;
+  return total==null?`${n} to create`:`${total} read · ${n} to create`;
 }
 
 function skippedTable(){
@@ -515,6 +571,7 @@ function renderCaptureTab(){
       <tr><th>Entities in the plan</th><td>${ents.length}</td></tr>
       <tr><th>CAT calls made</th><td>${ci.calls!=null?esc(ci.calls):"—"} <span class="mut">read-only GETs · took ${esc(ci.el||"?")}</span></td></tr>
       <tr><th>Saved capture</th><td><code>${esc(ci.capture_path||"—")}</code></td></tr>
+      <tr><th>Webhooks (workflows)</th><td>${webhooksFetchedLabel()}</td></tr>
       <tr><th>Steps planned</th><td>${steps.length} — ${kindCounts.map(([k,n])=>chip(`${KINDLABEL[k]||k} ×${n}`)).join(" ")}</td></tr>
       <tr><th>Flagged</th><td>${(PLAN.warnings||[]).length} warning(s) · ${(PLAN.skipped||[]).length} item(s) will not be created</td></tr>
     </table>
@@ -650,6 +707,22 @@ function progressHtml(p,t0){
     so even if the tab dies the record survives.</div>`;
 }
 
+// The new client's API keys, minted in the run and decrypted in the server process. This
+// is the only place they are ever shown; they are not in the journal or the plan. Copy them
+// somewhere safe now — reloading the page loses them.
+function renderDestinationKeys(dk){
+  const roles=[["sandbox_secret","Secret key"],["sandbox_public","Public key"]].filter(([k])=>dk&&dk[k]);
+  if(!roles.length) return "";
+  return `<div class="banner"><b>API keys created on the new client — shown once.</b>
+      Copy them now; they are not journalled and disappear when this page reloads.
+      <table>${roles.map(([k,label])=>{const d=dk[k];return `<tr><th style="width:110px">${label}</th>
+        <td><code id="dk_${k}" data-v="${esc(d.value)}">${esc(d.value.slice(0,12))}…</code>
+            <button class="rowbtn" onclick="revealKey('${k}')">reveal</button>
+            <button class="rowbtn" onclick="navigator.clipboard.writeText($('dk_${k}').dataset.v)">copy</button>
+            <span class="mut"> · ${esc(d.description||"")} · id ${esc(d.id||"—")} · ${esc(d.padding||"")}</span></td></tr>`;}).join("")}</table></div>`;
+}
+function revealKey(k){const el=$("dk_"+k); el.textContent=el.dataset.v;}
+
 function resultHtml(j,r,el){
   const c=r.counts, ok=c.failed===0, flags=r.flags||[];
   const objs=r.created_objects||[];
@@ -662,6 +735,7 @@ function resultHtml(j,r,el){
       Journal: <code>${esc(j.journal_path||r.journal_path||'—')}</code>
       ${ok?'':'<br><span class="err">No rollback. The objects below exist. Use Clean up (below) to remove what CAT allows.</span>'}
     </div>
+    ${renderDestinationKeys(r.destination_keys)}
     ${renderWarnings(flags.map(f=>f.message),flags,"findings from the run itself — what could only be learned once the clone existed. Add these to the handover.")}
     ${r.problems.length?`<div class="banner stop"><b>Problems</b><br>`+r.problems.map(esc).join("<br>")+`</div>`:''}
     <h3>What was done</h3>
@@ -953,6 +1027,7 @@ if(window.__DEV_CREDS__){const c=window.__DEV_CREDS__;
   if(c.client_id&&$("src_client"))$("src_client").value=c.client_id;
   if(c.cat_token&&$("cat_token"))$("cat_token").value=c.cat_token;
   if(c.sandbox_sk&&$("sbox_sk"))$("sbox_sk").value=c.sandbox_sk;
+  if(c.dest_sandbox_sk&&$("dest_sk"))$("dest_sk").value=c.dest_sandbox_sk;
   if(c.sandbox_pk&&$("sbox_pk"))$("sbox_pk").value=c.sandbox_pk;}
 $("capture").onclick=capture;
 $("loadents").onclick=loadEntities;

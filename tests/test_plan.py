@@ -30,7 +30,14 @@ import clone_capture as cc
 import clone_apply as capp
 import clone_cleanup as ccl
 import server
+import clone_keys
 import fixtures as fx
+
+# RSA keygen costs ~1s per 2048-bit key and every live-mock apply would mint one. One
+# 1024-bit keypair per test process is plenty: the suite asserts on the FLOW (register,
+# decrypt, feed, redact), never on key strength. clone_keys itself is tested directly.
+_TEST_KEYPAIR = clone_keys.generate(1024)
+capp.clone_keys.generate = lambda bits=2048: _TEST_KEYPAIR
 
 # Documented dependency order (README.md "Step order"). A single-entity plan must be
 # monotonic in this sequence; multi-entity plans repeat the entity-scoped tail.
@@ -40,7 +47,8 @@ KIND_ORDER = ["client", "client_risk_settings", "client_flow_account",
               "processing_profile", "entity_service", "processing_channel", "processor",
               "sessions_channel", "sessions_profile_processor",
               "payment_routing_rule", "payout_routing_rule", "payout_setting",
-              "payout_route_check"]
+              "payout_route_check", "client_public_crypto_key", "client_api_secret_key",
+              "client_api_public_key", "webhook_workflow", "webhook_check"]
 
 # The reference shape: 1 entity, 2 currency accounts, 6 profiles, 1 channel with 4
 # processors, a sessions channel with 4 profile-backed processors, 2 payment rules,
@@ -54,8 +62,17 @@ EXPECTED_COUNTS = {
     "sessions_channel": 1, "sessions_profile_processor": 4,
     "payment_routing_rule": 2, "payout_routing_rule": 1, "payout_setting": 1,
     "payout_route_check": 1,
+    # the destination's API keys, minted in the run (2026-09-08)
+    "client_public_crypto_key": 1, "client_api_secret_key": 1, "client_api_public_key": 1,
 }
-EXPECTED_STEPS = 31
+EXPECTED_STEPS = 34
+# Steps nothing downstream depends on: a live failure (or a missing key) is a flag and the
+# run continues. Everything else must be non-optional.
+OPTIONAL_KINDS = {"client_public_crypto_key", "client_api_secret_key", "client_api_public_key",
+                  "webhook_workflow", "webhook_check"}
+# Steps whose CREATE body legitimately carries entity_id (the known-good token create names
+# an entity); everywhere else entity_id is a server-assigned echo that must be stripped.
+ENTITY_ID_IS_A_REQUEST_FIELD = {"client_api_secret_key", "client_api_public_key"}
 
 ANY_PLACEHOLDER = re.compile(r"\{\{[^{}]*\}\}")
 CAT_ID = re.compile(r"^[a-z][a-z0-9]*_[a-z0-9]{26}$")
@@ -495,6 +512,12 @@ class TestKnownTraps(unittest.TestCase):
                 if k == "id" and isinstance(body.get("id"), str) \
                         and ANY_PLACEHOLDER.fullmatch(body["id"]):
                     continue
+                if k == "entity_id" and s["kind"] in ENTITY_ID_IS_A_REQUEST_FIELD:
+                    # a request field here, and it must be the CLONE's entity (placeholder
+                    # or empty), never a source id echoed back
+                    v = body.get("entity_id")
+                    self.assertTrue(v == "" or ANY_PLACEHOLDER.fullmatch(v), (s["kind"], v))
+                    continue
                 self.assertNotIn(k, body, f"step {s['seq']} ({s['kind']}) kept {k}")
 
     def test_entity_body_is_shaped_for_create_not_echoed_from_the_get(self):
@@ -879,7 +902,9 @@ class TestClientNetworkTokens(unittest.TestCase):
         for s in self.plan["steps"]:
             self.assertNotIn("network", s["kind"])
             self.assertIsNone(s["base"], s["kind"])       # nothing leaves CAT
-            self.assertFalse(s["optional"], s["kind"])
+            # the destination-key and webhook steps are the only optional ones
+            if s["kind"] not in OPTIONAL_KINDS:
+                self.assertFalse(s["optional"], s["kind"])
         self.assertTrue(any(x["kind"] == "client_network_tokens" for x in self.plan["skipped"]))
 
     def test_manual_flag_summarises_what_to_replicate(self):
@@ -1301,7 +1326,9 @@ class TestPayoutRouteParity(unittest.TestCase):
             run = capp.apply_plan(plan, base="https://x", token="t", dry_run=False,
                                   pace_seconds=0)
         self.assertEqual(run["counts"]["failed"], 0, run["problems"])
-        codes = sorted(f["code"] for f in run["flags"])
+        # this fake returns a bare id for the API-key creates, so their secrets cannot be
+        # recovered — that path has its own tests (TestDestinationApiKeys); ignore it here
+        codes = sorted(f["code"] for f in run["flags"] if not f["code"].startswith("api_key"))
         self.assertEqual(codes, ["display_currency_differs",
                                  "payout_route_missing_on_clone",
                                  "payout_route_schemes_differ"])
@@ -1314,6 +1341,8 @@ class TestPayoutRouteParity(unittest.TestCase):
                      "conversion_currencies_differ": "client_compass_check"}
         seq_of = {x["kind"]: x["seq"] for x in run["journal"]}
         for f in run["flags"]:
+            if f["code"].startswith("api_key"):
+                continue
             kind = next(v for k, v in raised_by.items() if f["code"].startswith(k))
             self.assertEqual(f["seq"], seq_of[kind], f["code"])
         # a read creates nothing to clean up
@@ -1861,7 +1890,9 @@ class TestMultiEntity(unittest.TestCase):
         cls.plan = plan_for(cls.cap)
 
     def test_entity_scoped_steps_are_doubled(self):
-        client_level = 6   # client, risk, flow, compass settings + check, vault_lookup
+        # client, risk, flow, compass settings + check, vault_lookup, and the three
+        # destination-key steps (crypto key, secret key, public key)
+        client_level = 9
         per_entity = EXPECTED_STEPS - client_level
         self.assertEqual(len(self.plan["steps"]), client_level + 2 * per_entity)
 
@@ -2091,6 +2122,383 @@ def _tmp_runs_dir():
     return _pl.Path(tempfile.mkdtemp())
 
 
+class TestWebhooks(unittest.TestCase):
+    """Webhooks are Workflows in the Checkout sandbox API: read with the SOURCE client's
+    secret key at capture, created with the DESTINATION's at apply, optional throughout."""
+
+    SRC_SK, DEST_SK = "sk_sbox_" + "s" * 32, "sk_sbox_" + "d" * 32
+
+    class StubReader:
+        """Answers GET /workflows and GET /workflows/{id} like the sandbox API."""
+        def __init__(self, workflows, list_code=200):
+            self.wfs = {w["id"]: w for w in workflows}
+            self.list_code = list_code
+            self.calls, self.errors, self.paths = 0, [], []
+        def get(self, path):
+            self.calls += 1; self.paths.append(path)
+            if path == "/workflows":
+                if self.list_code != 200:
+                    self.errors.append({"path": path, "code": self.list_code})
+                    return {}, self.list_code
+                return {"data": [{"id": w["id"], "name": w["name"], "active": w["active"],
+                                  "_links": w["_links"]} for w in self.wfs.values()]}, 200
+            wid = path.rsplit("/", 1)[-1]
+            return (self.wfs[wid], 200) if wid in self.wfs else ({}, 404)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cap = fx.webhooks_capture()
+        cls.plan = plan_for(cls.cap)
+        cls.eid = cls.cap["entities"][0]["id"]
+        cls.pcid = cls.cap["entities"][0]["processing_channels"][0]["id"]
+
+    # -- capture side ------------------------------------------------------------
+    def test_read_workflows_fetches_each_detail_and_labels_the_source(self):
+        wfs = self.cap["workflows"]
+        r = self.StubReader(wfs)
+        out, src = cc.read_workflows(r)
+        self.assertEqual(src, "sandbox-api")
+        self.assertEqual([w["id"] for w in out], [w["id"] for w in wfs])
+        self.assertTrue(all("conditions" in w and "actions" in w for w in out))
+        self.assertEqual(r.paths, ["/workflows"] + [f"/workflows/{w['id']}" for w in wfs])
+
+    def test_a_refused_list_is_unavailable_not_empty(self):
+        out, src = cc.read_workflows(self.StubReader([], list_code=401))
+        self.assertIsNone(out)
+        self.assertEqual(src, "unavailable")
+
+    def test_capture_reads_workflows_only_when_a_source_key_is_given(self):
+        # No key: nothing is read and the capture says so. With a key: a Reader is built
+        # against the sandbox API base with THAT key and the result lands in the capture.
+        made = []
+        class FakeReader:
+            def __init__(self, base, token):
+                made.append((base, token)); self.calls = 0; self.errors = []
+            def get(self, path):
+                self.calls += 1
+                if path == "/workflows":
+                    return {"data": []}, 200
+                return ({}, 200) if "clients" in path or "entities" in path else ({}, 404)
+            def hal(self, path, key):
+                return [], 200
+        with mock.patch.object(cc, "Reader", FakeReader):
+            cap = cc.capture("https://cat", "cat-tok", fx.SOURCE_CLIENT)
+            self.assertEqual((cap["workflows"], cap["workflows_source"]), (None, "no_key"))
+            self.assertFalse(any(t == self.SRC_SK for _, t in made))
+            made.clear()
+            cap = cc.capture("https://cat", "cat-tok", fx.SOURCE_CLIENT,
+                             sandbox_secret_key=self.SRC_SK)
+        self.assertEqual((cap["workflows"], cap["workflows_source"]), ([], "sandbox-api"))
+        self.assertIn((cc.SANDBOX_API_BASE, self.SRC_SK), made)
+
+    def test_capture_handler_passes_the_source_key_not_the_destination_key(self):
+        with mock.patch.object(server.cc, "capture", return_value=fx.reference_capture()) as c, \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()), NoSocket():
+            out = server.clone_capture_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t",
+                                                "sandbox_sk": self.SRC_SK,
+                                                "dest_sandbox_sk": self.DEST_SK})
+        self.assertIn("plan", out)
+        self.assertEqual(c.call_args.kwargs["sandbox_secret_key"], self.SRC_SK)
+
+    # -- plan side ---------------------------------------------------------------
+    def test_create_body_strips_every_server_id_and_remaps_scope_ids(self):
+        wf = self.cap["workflows"][0]
+        body, req, notes, emptied = cc.workflow_create_body(wf, {self.eid}, {self.pcid})
+        blob = json.dumps(body)
+        for prefix in ("wf_", "wfc_", "wfa_", "_links"):
+            self.assertNotIn(prefix, blob, prefix)
+        self.assertEqual(body["name"], "Payments webhook")
+        ents = next(c for c in body["conditions"] if c["type"] == "entity")
+        pcs = next(c for c in body["conditions"] if c["type"] == "processing_channel")
+        self.assertEqual(ents["entities"], [cc.ph(self.eid)])      # out-of-scope id gone
+        self.assertEqual(pcs["processing_channels"], [cc.ph(self.pcid)])
+        self.assertEqual(sorted(req), sorted([self.eid, self.pcid]))
+        self.assertTrue(any("not in this capture's scope" in n for n in notes))
+        self.assertIsNone(emptied)
+        # event condition, url, headers and signature are the configuration — carried
+        ev = next(c for c in body["conditions"] if c["type"] == "event")
+        self.assertEqual(ev["events"]["gateway"], ["payment_approved", "payment_declined"])
+        self.assertEqual(body["actions"][0]["url"], "https://merchant.example/hooks")
+        self.assertIn("signature", body["actions"][0]); self.assertIn("headers", body["actions"][0])
+
+    def test_a_workflow_scoped_only_outside_the_capture_is_skipped_and_flagged(self):
+        wf = self.cap["workflows"][1]
+        body, req, notes, emptied = cc.workflow_create_body(wf, {self.eid}, {self.pcid})
+        self.assertEqual(emptied, "entity")
+        hooks = steps_of(self.plan, "webhook_workflow")
+        self.assertEqual([s["label"] for s in hooks], ["Payments webhook"])
+        self.assertTrue(any(x["kind"] == "webhook_workflow" and "Other entity webhook" in x["reason"]
+                            for x in self.plan["skipped"]))
+        f = [x for x in self.plan["flags"] if x["code"] == "webhook_scope_emptied"]
+        self.assertEqual(len(f), 1); self.assertEqual(f[0]["action"], "not_created")
+
+    def test_webhook_steps_are_optional_sandbox_secret_posts_placed_last(self):
+        hooks = steps_of(self.plan, "webhook_workflow")
+        checks = steps_of(self.plan, "webhook_check")
+        self.assertEqual(len(hooks), 1); self.assertEqual(len(checks), 1)
+        h, c = hooks[0], checks[0]
+        self.assertEqual((h["method"], h["path"], h["auth"], h["optional"]),
+                         ("POST", "/workflows", "sandbox_secret", True))
+        self.assertEqual((c["method"], c["path"], c["auth"], c["optional"]),
+                         ("GET", "/workflows", "sandbox_secret", True))
+        self.assertEqual(c["verify"], {"compare": "workflows", "expected": ["Payments webhook"]})
+        self.assertIsNone(h["provides"])
+        self.assertEqual(sorted(h["requires"]), sorted([self.eid, self.pcid]))
+        # after every CAT step: the ids it references are minted earlier in the run
+        self.assertEqual([s["kind"] for s in self.plan["steps"][-2:]],
+                         ["webhook_workflow", "webhook_check"])
+        # every step it requires is provided earlier — validate_plan raises nothing new
+        problems = [p for p in cc.validate_plan(self.plan) if not p.startswith("warning:")]
+        self.assertEqual(problems, [])
+        # every CAT step is untouched by auth
+        self.assertTrue(all(s["auth"] is None for s in self.plan["steps"]
+                            if not s["kind"].startswith("webhook")))
+
+    def test_the_receiver_url_is_flagged_for_confirmation(self):
+        f = [x for x in self.plan["flags"] if x["code"] == "webhook_url_carried"]
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["url"], "https://merchant.example/hooks")
+        self.assertEqual(f[0]["action"], "carried")
+
+    def test_no_workflows_means_no_webhook_steps_or_flags(self):
+        plan = plan_for(fx.reference_capture())
+        self.assertEqual(steps_of(plan, "webhook_workflow") + steps_of(plan, "webhook_check"), [])
+        self.assertFalse(any(x["code"].startswith("webhook") for x in plan["flags"]))
+
+    def test_unread_and_unavailable_workflows_are_flagged_not_silent(self):
+        plan = plan_for(fx.webhooks_not_read_capture())
+        f = [x for x in plan["flags"] if x["code"] == "webhooks_not_read"]
+        self.assertEqual(len(f), 1); self.assertIn("Source Sandbox Secret Key", f[0]["message"])
+        self.assertEqual(steps_of(plan, "webhook_workflow"), [])
+        plan = plan_for(fx.webhooks_unavailable_capture())
+        f = [x for x in plan["flags"] if x["code"] == "webhooks_unavailable"]
+        self.assertEqual(len(f), 1); self.assertEqual(f[0]["errors"][0]["code"], 401)
+
+    # -- apply side --------------------------------------------------------------
+    def test_without_the_destination_key_webhooks_block_and_the_clone_still_completes(self):
+        with NoSocket():
+            run = capp.apply_plan(self.plan)          # dry run, no keys at all
+        hooks = [e for e in run["journal"] if e["kind"].startswith("webhook")]
+        self.assertEqual(len(hooks), 2)
+        for e in hooks:
+            self.assertEqual(e["status"], "blocked")
+            self.assertIn("Destination Sandbox Secret Key", e["error"])
+            self.assertEqual(e["flags"][0]["code"], "optional_step_blocked")
+        cat_steps = len(self.plan["steps"]) - 2
+        self.assertEqual(run["counts"], {"steps": cat_steps + 2, "created": cat_steps,
+                                         "failed": 2, "not_attempted": 0})
+        self.assertEqual([f["code"] for f in run["flags"]], ["optional_step_blocked"] * 2)
+
+    def test_with_the_destination_key_the_dry_run_resolves_every_placeholder(self):
+        with NoSocket():
+            run = capp.apply_plan(self.plan, sandbox_keys={"sandbox_secret": self.DEST_SK})
+        self.assertEqual(run["counts"]["failed"], 0)
+        hook = next(e for e in run["journal"] if e["kind"] == "webhook_workflow")
+        blob = json.dumps(hook["body"])
+        self.assertNotIn("{{", blob)
+        self.assertNotIn(self.eid, blob); self.assertNotIn(self.pcid, blob)
+        self.assertEqual(hook["auth"], "sandbox_secret")
+
+    def test_live_webhook_steps_go_to_the_sandbox_api_with_the_destination_key(self):
+        sent = []
+        def fake_send(base, bearer, method, path, body=None, **kw):
+            sent.append((base, bearer, method, path))
+            if path == "/workflows" and method == "GET":
+                return {"data": [{"id": "wf_x", "name": "Payments webhook", "active": True}]}, 200, None
+            return {"id": "new_" + str(len(sent))}, 201, None
+        with mock.patch.object(capp, "_send", side_effect=fake_send), \
+             mock.patch("time.sleep", lambda *a, **k: None):
+            run = capp.apply_plan(self.plan, base="https://cat", token="cat-token",
+                                  dry_run=False, pace_seconds=0,
+                                  sandbox_keys={"sandbox_secret": self.DEST_SK,
+                                                "source_sandbox_secret": self.SRC_SK})
+        hooks = [s for s in sent if s[3] == "/workflows"]
+        self.assertEqual(len(hooks), 2)
+        for base, bearer, _, _ in hooks:
+            self.assertEqual(base, capp.SANDBOX_API_BASE)
+            self.assertEqual(bearer, self.DEST_SK)
+        self.assertTrue(all(s[1] == "cat-token" and s[0] == "https://cat"
+                            for s in sent if s[3] != "/workflows"))
+        self.assertEqual(run["counts"]["failed"], 0)
+        self.assertFalse(any(f["code"] == "webhook_missing_on_clone" for f in run["flags"]))
+        self.assertNotIn(self.SRC_SK, json.dumps(run)); self.assertNotIn(self.DEST_SK, json.dumps(run))
+
+    def test_read_back_flags_a_workflow_the_clone_does_not_list(self):
+        flags, summary = capp.verify_workflows(["A", "B"], {"data": [{"name": "A"}, {"name": "Z"}]})
+        self.assertEqual([f["code"] for f in flags], ["webhook_missing_on_clone"])
+        self.assertEqual(flags[0]["name"], "B")
+        self.assertEqual(summary, {"expected": 2, "found": 1, "missing": ["B"], "on_clone": 2})
+        self.assertEqual(capp.verify_workflows(["A"], {"data": [{"name": "A"}]})[0], [])
+
+    def test_cleanup_knows_a_workflow_cannot_be_removed_via_cat(self):
+        self.assertEqual(ccl.REMOVAL["webhook_workflow"]["mode"], "none")
+        self.assertIn("destination secret key", ccl.REMOVAL["webhook_workflow"]["why"])
+
+
+class TestDestinationApiKeys(unittest.TestCase):
+    """The new client's API keys are minted inside the run: register the run's RSA public
+    key, create a secret and a public key encrypted with it, decrypt them here, feed the
+    secret to the webhook steps, show both once, journal neither."""
+
+    @classmethod
+    def setUpClass(cls):
+        import clone_keys
+        cls.ck = clone_keys
+        cls.plan = plan_for(fx.webhooks_capture())     # keys + a webhook that needs them
+        cls.SECRET, cls.PUBLIC = "sk_sbox_" + "m" * 26, "pk_sbox_" + "n" * 26
+
+    # -- the RSA module ------------------------------------------------------------
+    def test_keypair_pem_is_pkcs1_and_roundtrips(self):
+        kp = _TEST_KEYPAIR
+        pem = kp.public_pem
+        self.assertTrue(pem.startswith("-----BEGIN RSA PUBLIC KEY-----\n"))
+        self.assertTrue(pem.rstrip().endswith("-----END RSA PUBLIC KEY-----"))
+        self.assertEqual(self.ck.parse_public_pem(pem), (kp.n, kp.e))
+        for ct, pad in ((self.ck.encrypt_pkcs1_v15(pem, self.SECRET.encode()), "PKCS1-v1.5"),
+                        (self.ck.encrypt_oaep(pem, self.PUBLIC.encode()), "OAEP-SHA256")):
+            value, padding = kp.decrypt(ct)
+            self.assertEqual(padding, pad)
+            self.assertIn(value, (self.SECRET, self.PUBLIC))
+        with self.assertRaises(ValueError):
+            kp.decrypt(self.ck.encrypt_pkcs1_v15(pem, b"definitely not an api key"))
+
+    def test_scope_catalogue_splits_by_side(self):
+        cfg = {"scopes": [{"value": "gateway", "label": "gateway", "side_label": "secret"},
+                          {"value": "vault:tokenization", "label": "vault:tokenization",
+                           "side_label": "public"},
+                          {"value": "notifier:workflows", "label": "notifier:workflows",
+                           "side_label": "secret"}]}
+        self.assertEqual(cc.api_key_scopes_from(cfg),
+                         {"secret": ["gateway", "notifier:workflows"],
+                          "public": ["vault:tokenization"]})
+        self.assertIsNone(cc.api_key_scopes_from({}))
+        self.assertIsNone(cc.api_key_scopes_from({"scopes": [{"value": "x", "side_label": "secret"}]}))
+
+    # -- the plan ------------------------------------------------------------------
+    def test_three_optional_key_steps_follow_the_entities_and_precede_the_webhooks(self):
+        kinds = [s["kind"] for s in self.plan["steps"]]
+        i_pk, i_sk, i_pub = (kinds.index(k) for k in
+                             ("client_public_crypto_key", "client_api_secret_key", "client_api_public_key"))
+        self.assertTrue(i_pk < i_sk < i_pub < kinds.index("webhook_workflow"))
+        self.assertTrue(max(i for i, k in enumerate(kinds) if k == "entity") < i_pk)
+        pk, sk, pub = (steps_of(self.plan, k)[0] for k in
+                       ("client_public_crypto_key", "client_api_secret_key", "client_api_public_key"))
+        for s in (pk, sk, pub):
+            self.assertTrue(s["optional"]); self.assertIsNone(s["auth"]); self.assertEqual(s["method"], "POST")
+        self.assertEqual(pk["body"], {"name": pk["body"]["name"], "type": "RSA",
+                                      "key": cc.PUBLIC_KEY_PEM_MARKER})
+        self.assertRegex(pk["body"]["name"], r"^PUB KEY CAT SETUP \d{5}$")
+        self.assertEqual(pk["provides"], cc.PUBLIC_CRYPTO_KEY_PROVIDES)
+        self.assertTrue(pk["path"].endswith("/public-keys"))
+        for s, side, desc in ((sk, "secret", "CAT SETUP SECRET"), (pub, "public", "CAT SET UP PUB")):
+            self.assertTrue(s["path"].endswith("/standalone-reference-tokens"))
+            self.assertEqual(s["body"]["description"], desc)
+            self.assertEqual(s["body"]["scopes"], fx.reference_capture()["api_key_scopes"][side])
+            self.assertEqual(s["body"]["public_key_id"], cc.ph(cc.PUBLIC_CRYPTO_KEY_PROVIDES))
+            self.assertEqual((s["body"]["allow_any_processing_channel"], s["body"]["processing_channel_ids"]), (True, []))
+        self.assertEqual(sk["body"]["entity_id"], cc.ph(fx.reference_capture()["entities"][0]["id"]))
+        self.assertEqual(pub["body"]["entity_id"], "")
+        # the marker is not a placeholder: validate_plan and unresolved() must ignore it
+        self.assertEqual([p for p in cc.validate_plan(self.plan) if not p.startswith("warning:")], [])
+
+    def test_no_scope_catalogue_means_no_key_steps_and_a_flag(self):
+        plan = plan_for(fx.no_api_key_scopes_capture())
+        self.assertEqual([s for s in plan["steps"] if s["kind"].startswith("client_api") or s["kind"] == "client_public_crypto_key"], [])
+        f = [x for x in plan["flags"] if x["code"] == "api_keys_not_planned"]
+        self.assertEqual(len(f), 1); self.assertIn("DESTINATION API KEYS NOT CREATED", f[0]["message"])
+
+    # -- apply ----------------------------------------------------------------------
+    def test_dry_run_substitutes_a_stand_in_pem_and_resolves_everything(self):
+        with NoSocket():
+            run = capp.apply_plan(self.plan, sandbox_keys={"sandbox_secret": "sk_sbox_" + "z" * 26})
+        pk = next(e for e in run["journal"] if e["kind"] == "client_public_crypto_key")
+        self.assertEqual(pk["body"]["key"], capp.DRY_RUN_PEM)
+        self.assertNotIn(cc.PUBLIC_KEY_PEM_MARKER, json.dumps(run))
+        self.assertNotIn(cc.PUBLIC_KEY_PEM_MARKER, json.dumps(run["id_map"]))
+        self.assertEqual(run["counts"]["failed"], 0)
+        self.assertEqual(run["destination_keys"], {})
+
+    def _live(self, plan=None, sandbox_keys=None, secret_ok=True):
+        """Play CAT: capture the PEM the run registers, hand back secrets encrypted with it."""
+        import tempfile, pathlib as _pl
+        state = {"pem": None, "sent": []}
+        def fake_send(base, bearer, method, path, body=None, **kw):
+            state["sent"].append((base, bearer, method, path, body))
+            if path.endswith("/public-keys"):
+                state["pem"] = body["key"]
+                return {"id": "3i3jgthodwk6ywjvlhxywynimm", "name": body["name"], "type": "RSA"}, 201, None
+            if path.endswith("/standalone-reference-tokens"):
+                if not secret_ok:
+                    return {"id": "FD47"}, 201, None
+                value = self.SECRET if body["description"] == "CAT SETUP SECRET" else self.PUBLIC
+                return {"id": "FD4746005185C0518EE4E7A4FD1CE383",
+                        "temporary_secret": self.ck.encrypt_pkcs1_v15(state["pem"], value.encode())}, 201, None
+            if path == "/workflows" and method == "GET":
+                return {"data": [{"id": "wf_x", "name": "Payments webhook"}]}, 200, None
+            if method == "GET":
+                return {"id": fx._id("vact", "clonevault")}, 200, None
+            return {"id": fx._id("new", path.rsplit("/", 1)[-1][:8])}, 201, None
+        tmp = _pl.Path(tempfile.mkdtemp()) / "j.jsonl"
+        with mock.patch.object(capp, "_send", side_effect=fake_send), \
+             mock.patch("time.sleep", lambda *a, **k: None):
+            run = capp.apply_plan(plan or self.plan, base="https://cat", token="cat-token",
+                                  dry_run=False, pace_seconds=0, journal_path=str(tmp),
+                                  sandbox_keys=sandbox_keys)
+        return run, state, tmp.read_text()
+
+    def test_live_run_mints_decrypts_and_uses_the_secret_for_the_webhooks(self):
+        run, state, journal_text = self._live()
+        self.assertEqual(run["counts"]["failed"], 0, run["problems"])
+        # a real PEM was registered, not the marker or the stand-in
+        self.assertTrue(state["pem"].startswith("-----BEGIN RSA PUBLIC KEY-----"))
+        self.assertNotIn(state["pem"], (cc.PUBLIC_KEY_PEM_MARKER, capp.DRY_RUN_PEM))
+        # both keys decrypted and returned once
+        dk = run["destination_keys"]
+        self.assertEqual((dk["sandbox_secret"]["value"], dk["sandbox_public"]["value"]), (self.SECRET, self.PUBLIC))
+        self.assertEqual(dk["sandbox_secret"]["description"], "CAT SETUP SECRET")
+        self.assertEqual(dk["sandbox_secret"]["padding"], "PKCS1-v1.5")
+        # the webhook steps were sent with the MINTED secret, with no key pasted
+        hooks = [s for s in state["sent"] if s[3] == "/workflows"]
+        self.assertEqual(len(hooks), 2)
+        self.assertTrue(all(b == self.SECRET and base == capp.SANDBOX_API_BASE for base, b, _, _, _ in hooks))
+        # the journal entry says which role and prefix, and that is all
+        e = next(x for x in run["journal"] if x["kind"] == "client_api_secret_key")
+        self.assertEqual(e["decrypted"]["role"], "sandbox_secret")
+        self.assertEqual(e["decrypted"]["prefix"], self.SECRET[:8])
+        self.assertIn("used_for", e["decrypted"])
+        self.assertIn('"temporary_secret": "REDACTED"', e["response_excerpt"])
+
+    def test_plaintext_and_ciphertext_never_reach_the_journal(self):
+        run, state, journal_text = self._live()
+        journal_blob = json.dumps(run["journal"])
+        for secret in (self.SECRET, self.PUBLIC):
+            self.assertNotIn(secret, journal_blob)
+            self.assertNotIn(secret, journal_text)
+        for ct in (s[4] for s in state["sent"] if s[4] and "temporary_secret" in json.dumps(s[4])):
+            self.fail("a ciphertext was sent in a request body")   # sanity: never happens
+        self.assertNotIn("temporary_secret\": \"" + "ey", journal_text)   # no ciphertext leak
+        # the only exit is the run document's destination_keys
+        self.assertIn(self.SECRET, json.dumps(run["destination_keys"]))
+
+    def test_a_pasted_destination_key_wins_over_the_minted_one(self):
+        pasted = "sk_sbox_" + "p" * 26
+        run, state, _ = self._live(sandbox_keys={"sandbox_secret": pasted})
+        hooks = [s for s in state["sent"] if s[3] == "/workflows"]
+        self.assertTrue(all(b == pasted for _, b, _, _, _ in hooks))
+        self.assertEqual(run["destination_keys"]["sandbox_secret"]["value"], self.SECRET)
+        e = next(x for x in run["journal"] if x["kind"] == "client_api_secret_key")
+        self.assertNotIn("used_for", e["decrypted"])
+
+    def test_an_unrecoverable_secret_is_flagged_and_the_webhooks_block(self):
+        run, state, _ = self._live(secret_ok=False)
+        codes = [f["code"] for f in run["flags"]]
+        self.assertEqual(codes.count("api_key_undecryptable"), 2)
+        self.assertEqual(codes.count("optional_step_blocked"), 2)   # webhook_workflow + check
+        self.assertEqual([s for s in state["sent"] if s[3] == "/workflows"], [])
+        self.assertEqual(run["destination_keys"], {})
+        self.assertEqual(run["counts"]["failed"], 2)                 # only the two webhook steps
+
+
 class TestLiveProgress(unittest.TestCase):
     """The Apply page shows where a run is up to. apply_plan tells a listener about each
     step as it is journalled; the server keeps a slim copy per run_id for the page to poll."""
@@ -2207,15 +2615,28 @@ class TestSandboxKeys(unittest.TestCase):
             self.assertIn("sk_sbox_" if "Secret" in out["error"] else "pk_sbox_", out["error"])
 
     def test_sandbox_prefixed_keys_are_accepted_and_reach_apply(self):
+        # dest_sandbox_sk is the DESTINATION client's key — the one apply sends sandbox-API
+        # steps with. sandbox_sk is the SOURCE's and only ever reads.
+        src = "sk_sbox_" + "s" * 32
         with NoSocket(), mock.patch.object(server.capp, "apply_plan",
                                           wraps=server.capp.apply_plan) as ap:
             out = server.clone_apply_handler({"plan": self.sandbox_plan(),
-                                              "sandbox_sk": f"  {self.SK} ",
-                                              "sandbox_pk": self.PK})
+                                              "dest_sandbox_sk": f"  {self.SK} ",
+                                              "sandbox_sk": src, "sandbox_pk": self.PK})
         self.assertNotIn("error", out)
         self.assertEqual(ap.call_args.kwargs["sandbox_keys"],
-                         {"sandbox_secret": self.SK, "sandbox_public": self.PK})
+                         {"sandbox_secret": self.SK, "source_sandbox_secret": src,
+                          "sandbox_public": self.PK})
         self.assertEqual(out["run"]["counts"]["failed"], 0)
+
+    def test_the_source_key_alone_never_authenticates_an_apply_step(self):
+        # Only the destination key may create on the sandbox API. A source key on its own
+        # leaves a sandbox_secret step blocked — it is never promoted to fill the gap.
+        with NoSocket():
+            run = capp.apply_plan(self.sandbox_plan(),
+                                  sandbox_keys={"source_sandbox_secret": self.SK})
+        self.assertEqual(run["journal"][0]["status"], "blocked")
+        self.assertIn("Sandbox Secret Key", run["journal"][0]["error"])
 
     def test_absent_keys_do_not_affect_a_cat_only_plan(self):
         plan = plan_for(fx.reference_capture())
@@ -2347,6 +2768,9 @@ class TestCleanup(unittest.TestCase):
             "entity_service": "none", "client_risk_settings": "none",
             "client_compass_settings": "none", "client_flow_account": "none",
             "client_network_tokens": "none",   # entry kept for runs that did create one
+            "webhook_workflow": "none",        # sandbox API, not CAT; needs the dest key
+            "client_public_crypto_key": "none", "client_api_secret_key": "none",
+            "client_api_public_key": "none",   # disabled with the client; delete in CAT
         }
         self.assertEqual({k: v["mode"] for k, v in ccl.REMOVAL.items()}, expected)
 

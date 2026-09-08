@@ -603,8 +603,82 @@ def reference_capture():
         "only_entity": None,
         "entities": [_entity("a")],
         "valid_currencies": copy.deepcopy(VALID_CURRENCIES),
+        # Webhooks (Workflows) were read from the sandbox API and the client has none, so
+        # the reference plan stays free of webhook steps and flags.
+        "workflows": [],
+        "workflows_source": "sandbox-api",
+        # Shaped like api_key_scopes_from(GET /access-keys/configuration): the scope names
+        # each side of API key may carry. Drives the three destination-key steps.
+        "api_key_scopes": {"secret": ["gateway", "notifier:events", "notifier:workflows"],
+                           "public": ["middleware:merchants-public", "payment-sessions:pay",
+                                      "vault:tokenization"]},
         "_meta": {"calls": 47, "errors": []},
     }
+
+
+def no_api_key_scopes_capture():
+    """The scope catalogue could not be read: no destination keys can be planned."""
+    cap = reference_capture()
+    cap["api_key_scopes"] = None
+    return cap
+
+
+# ---- webhooks (Workflows in the Checkout sandbox API) --------------------------------
+
+def _workflow(tag, name, entity_ids=(), channel_ids=(), url="https://merchant.example/hooks",
+              active=True):
+    """Shaped like GET /workflows/{id} (get-workflow-response): server ids at every level,
+    _links everywhere, an event condition, optional entity / processing_channel conditions,
+    and one webhook action carrying headers and a signing key."""
+    wid = _id("wf", tag)
+    link = lambda suffix: {"self": {"href": f"https://api.sandbox.checkout.com/workflows/{wid}{suffix}"}}
+    conds = [{"id": _id("wfc", tag + "ev"), "type": "event",
+              "events": {"gateway": ["payment_approved", "payment_declined"],
+                         "dispute": ["dispute_won"]},
+              "_links": link(f"/conditions/{_id('wfc', tag + 'ev')}")}]
+    if entity_ids:
+        conds.append({"id": _id("wfc", tag + "en"), "type": "entity",
+                      "entities": list(entity_ids),
+                      "_links": link(f"/conditions/{_id('wfc', tag + 'en')}")})
+    if channel_ids:
+        conds.append({"id": _id("wfc", tag + "pc"), "type": "processing_channel",
+                      "processing_channels": list(channel_ids),
+                      "_links": link(f"/conditions/{_id('wfc', tag + 'pc')}")})
+    return {"id": wid, "name": name, "active": active, "conditions": conds,
+            "actions": [{"id": _id("wfa", tag), "type": "webhook", "url": url,
+                         "headers": {"Authorization": "src-auth-" + tag},
+                         "signature": {"method": "HMACSHA256", "key": "src-signing-" + tag},
+                         "_links": link(f"/actions/{_id('wfa', tag)}")}],
+            "_links": link("")}
+
+
+def webhooks_capture():
+    """Reference client with two workflows: one scoped to the captured entity and its
+    channel (cloned), one scoped only to an entity outside the capture (skipped)."""
+    cap = reference_capture()
+    eid = cap["entities"][0]["id"]
+    pcid = cap["entities"][0]["processing_channels"][0]["id"]
+    cap["workflows"] = [
+        _workflow("inscope", "Payments webhook", entity_ids=[eid, _id("ent", "elsewhere")],
+                  channel_ids=[pcid]),
+        _workflow("outscope", "Other entity webhook", entity_ids=[_id("ent", "elsewhere")]),
+    ]
+    return cap
+
+
+def webhooks_not_read_capture():
+    """No source secret key was supplied, so the workflows were never read."""
+    cap = reference_capture()
+    cap["workflows"], cap["workflows_source"] = None, "no_key"
+    return cap
+
+
+def webhooks_unavailable_capture():
+    """A source key was supplied but the sandbox API refused it (401)."""
+    cap = reference_capture()
+    cap["workflows"], cap["workflows_source"] = None, "unavailable"
+    cap["_meta"]["errors"].append({"path": "/workflows", "code": 401})
+    return cap
 
 
 def no_currency_validation_capture():

@@ -25,8 +25,9 @@ python3 app/server.py     # http://localhost:8788
 |---|---|
 | Client ID | prefills from `app/dev-creds.json` — this is the **source** client |
 | **CAT API bearer token** | **paste this** — short-lived Okta token, expires in ~1h |
-| Sandbox Secret Key | `sk_sbox_…` — prefills from the gitignored `app/dev-creds.local.json` if present, else typed; used only by steps that call the Checkout sandbox API |
-| Sandbox Public Key | `pk_sbox_…` — same, for endpoints that take a public key |
+| Source Sandbox Secret Key | the **source** client's `sk_sbox_…` — prefills from the gitignored `app/dev-creds.local.json` if present, else typed. Read-only: capture uses it to read the source's webhooks (Workflows) from the Checkout sandbox API |
+| Destination Sandbox Secret Key | **optional.** The run mints the new client's API keys itself (see *Step order*) and uses the secret one for the webhooks. Paste a key here only if the new client already has one you want used instead |
+| Sandbox Public Key | `pk_sbox_…` — reserved for endpoints that take a public key; nothing uses it yet |
 
 Top right, a **Sandbox → Sandbox / Prod → Sandbox** toggle says where the *source* is read
 from (the clone is always created in sandbox). It defaults to Sandbox → Sandbox. Nothing
@@ -111,15 +112,54 @@ completed every step is still auditable for what the plan chose not to attempt.
 
 ### Step order
 
-18 step kinds, in dependency order:
+23 step kinds, in dependency order:
 
 ```
 client → client_risk_settings → client_flow_account → client_compass_settings →
 client_compass_check → vault_lookup → entity → currency_account → processing_profile →
 entity_service → processing_channel → processor → sessions_channel →
 sessions_profile_processor → payment_routing_rule → payout_routing_rule →
-payout_setting → payout_route_check
+payout_setting → payout_route_check → client_public_crypto_key →
+client_api_secret_key → client_api_public_key → webhook_workflow → webhook_check
 ```
+
+**The new client's API keys are minted inside the run** (`client_public_crypto_key`,
+`client_api_secret_key`, `client_api_public_key`; contract from Patrick's live calls,
+2026-09-08). CAT only ever hands a key's secret back **RSA-encrypted** with a public crypto
+key registered on the client, so the run generates a keypair at apply time
+(`clone_keys.py`, pure stdlib), registers the public half (`POST /clients/{id}/public-keys`,
+`{name: "PUB KEY CAT SETUP nnnnn", type: "RSA", key: <PKCS#1 PEM>}`), creates a secret key
+and a public key (`POST /clients/{id}/standalone-reference-tokens` with every "secret"-side
+scope, then every "public"-side scope, from `GET /access-keys/configuration`; descriptions
+`CAT SETUP SECRET` / `CAT SET UP PUB`), and decrypts the two `temporary_secret`s with the
+private half — trying PKCS#1 v1.5 and OAEP, accepting only a result shaped like an API key.
+The private key lives in process memory for the run and nowhere else. The secret key is
+fed straight to the webhook steps that follow (a pasted Destination key wins if present);
+both plaintexts are returned to the page **once** in `run["destination_keys"]` and are
+never journalled — response excerpts redact `temporary_secret`/`secret`, and the journal
+entry records only the key's role and prefix. All three steps are `optional`. The plan
+carries a literal marker `<<RUN_PUBLIC_KEY_PEM>>`, not a placeholder, so no key material
+is ever in a plan document. If the scope catalogue cannot be read, no key steps are
+planned and `api_keys_not_planned` says so.
+
+**Webhooks (`webhook_workflow`, `webhook_check`) are the two steps that do not go to CAT.**
+Webhooks are Workflows in the client-facing Checkout sandbox API. Capture reads the
+source's with the *Source* Sandbox Secret Key (`GET /workflows`, then each
+`GET /workflows/{id}` — the list carries only id/name/active). The plan emits one
+`POST /workflows` per source workflow with `auth: "sandbox_secret"`: server ids (`wf_`,
+`wfc_`, `wfa_`) and `_links` are stripped at every level (`clean()` would not reach them),
+entity and processing-channel conditions are remapped through the id map, and any id
+outside the capture's scope is dropped — a condition left empty means the workflow is
+**skipped and flagged** (`webhook_scope_emptied`), never created with a widened match. The
+event condition, the receiver URL, its headers and the signing key are carried as-is
+(they *are* the configuration for a sandbox → sandbox clone); the URL is flagged
+(`webhook_url_carried`) so the operator confirms the receiver. Apply sends these with the
+*Destination* Sandbox Secret Key against `api.sandbox.checkout.com`. Both steps are
+`optional`: without the destination key they are **blocked with an `optional_step_blocked`
+flag and the run continues**, so a CAT clone never fails because the new client's keys
+have not been created yet. `webhook_check` reads the clone's workflows back and flags any
+created name it does not list. Without a source key nothing is read and the plan says so
+(`webhooks_not_read`); a refused key gives `webhooks_unavailable`.
 
 **Three client-level services are never cloned, and every plan says so in one line each**,
 at the top of every page:
@@ -219,7 +259,7 @@ fall into three tiers:
 |---|---|
 | **DELETE** | currency account, payment routing rule, payout routing rule, payout setting, payout route |
 | **DEACTIVATE ONLY** (`PUT …/status` → Inactive; no DELETE exists) | client, entity, processing profile, sessions channel |
-| **NEITHER** | processing channel, processor, entity service (prism), client risk settings, Compass settings, Flow account, network tokens |
+| **NEITHER** | processing channel, processor, entity service (prism), client risk settings, Compass settings, Flow account, network tokens, the clone's API keys and RSA crypto key (disabled with the client; delete in CAT if wanted), webhook workflow (sandbox API, not CAT — remove in Dashboard › Developers › Workflows) |
 
 Channels and processors can be neither deleted nor deactivated — their PUT schema carries no
 status field and there is no `/status` endpoint. The client-level settings steps are
@@ -382,15 +422,12 @@ profiles** (excluded by policy so far), **arrears** configuration, the **Prod �
 payout-schedule account details** callout, **reporting profiles**, and **webhooks**. Until
 each is built or ruled out it should become a one-line manual-step flag like the three above.
 
-**Webhooks were never built** (checked 2026-09-04: nothing in code, history or journals).
-They are not a CAT resource. They are **Workflows in the client-facing Checkout API** —
-confirmed via the `checkout-mcp-sandbox` MCP: `GET /workflows`, `GET /workflows/{id}`,
-`POST /workflows`, per-workflow `/actions` and `/conditions`, and `GET /workflows/event-types`;
-the webhook itself is a `webhook-action` on a workflow. They authenticate with a **secret
-key**, which is what the `auth: "sandbox_secret"` seam in `clone_apply` exists for. Reading
-the source needs the *source* client's `sk_sbox_`; creating on the clone needs the
-*destination's*, which cannot exist until its access keys are created by hand — so those
-steps must stay blocked until then. Design notes in TODO §00.7.
+**Webhooks are cloned for sandbox → sandbox, and the new client's API keys are minted in the
+run** (built 2026-09-08; see *Step order*). Not yet verified live: the first live run will
+settle (a) whether `POST /public-keys` accepts `{name, type, key}` as the swagger declares,
+(b) which RSA padding CAT uses — the decryptor tries both and says which — and (c) whether
+`POST /workflows` accepts the carried body unchanged. Prod → Sandbox webhooks (prod source
+key, URL substitution) are still open — TODO §00.5/§00.7.
 
 ---
 
@@ -404,6 +441,7 @@ app/
   clone_capture.py     # read source -> ordered plan  (GET only)
   clone_apply.py       # execute a plan (dry-run by default; on_step progress hook)
   clone_cleanup.py     # reverse a run, as far as CAT allows
+  clone_keys.py        # stdlib RSA: keygen, PKCS#1 PEM, decrypt (padding detected) — mints the clone's API keys
   dev-creds.json       # tracked: sandbox source client id only
   dev-creds.local.json # gitignored, mode 600: your sandbox_sk / sandbox_pk for prefill
 tests/
@@ -441,16 +479,22 @@ in `app/dev-creds.local.json` (gitignored, mode 600) as `sandbox_sk` / `sandbox_
 any value without the `sk_sbox_` / `pk_sbox_` prefix so a production key can never be
 pre-filled. The CAT token is never cached.
 
-**Sandbox API keys** (`Sandbox Secret Key` / `Sandbox Public Key` on the side panel) are
-optional and prefilled from the local file above when it exists, otherwise typed. The CAT
-token is always pasted; nothing in this app can obtain one. The page sends them with every request alongside the
-CAT token; `server.sandbox_keys` refuses anything not prefixed `sk_sbox_` / `pk_sbox_` on
-every route, so a production key never gets past the handler. Inside `clone_apply`, a step
-opts in with `auth: "sandbox_secret"` (or `"sandbox_public"`) and is then sent with that key
-against `api.sandbox.checkout.com` instead of the CAT token; a sandbox step with no key is
-**blocked**, never sent with the CAT token, and a dry run shows that block. No plan step
-uses this yet — it is the seam for the sandbox-side actions to come. The journal header
-records *which* keys were supplied, never their values.
+**Sandbox API keys** on the side panel are optional; the source key prefills from the local
+file above when it exists. The CAT token is always pasted; nothing in this app can obtain
+one. Three fields, three roles (`server.SANDBOX_KEY_FIELDS`):
+
+| Field | Request key | Role |
+|---|---|---|
+| Source Sandbox Secret Key | `sandbox_sk` | `source_sandbox_secret` — **read-only**, used by capture to read the source's webhooks |
+| Destination Sandbox Secret Key | `dest_sandbox_sk` | `sandbox_secret` — the auth mode `clone_apply` uses for sandbox-API steps (webhook creates) |
+| Sandbox Public Key | `sandbox_pk` | `sandbox_public` — reserved |
+
+`server.sandbox_keys` refuses anything not prefixed `sk_sbox_` / `pk_sbox_` on every route,
+so a production key never gets past the handler. Inside `clone_apply`, a step opts in with
+`auth: "sandbox_secret"` and is sent with the **destination** key against
+`api.sandbox.checkout.com`; the source key is never promoted to fill a missing destination
+key — the step is **blocked**, and a dry run shows that block. The journal header records
+*which* keys were supplied, never their values.
 
 `clone-runs/` is gitignored: journals contain real created-object ids from write runs, and
 saved captures contain a real client's full configuration — addresses, emails, bank details.

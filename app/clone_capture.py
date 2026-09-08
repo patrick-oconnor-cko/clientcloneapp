@@ -197,6 +197,10 @@ def payout_route_currencies(payload):
 # template at /clients/{id}/network-tokens; the client's actual configuration is read
 # from here. Sandbox host — this tool is sandbox-only.
 NT_PORTAL_BASE = "https://nt-portal.sbox.checkout.internal/vault-nt-portal/cat/configurations"
+# Webhooks are not a CAT resource. They are Workflows in the client-facing Checkout sandbox
+# API, read with the SOURCE client's secret key and created with the DESTINATION's. The
+# same constant lives in clone_apply (the modules are deliberately self-contained).
+SANDBOX_API_BASE = "https://api.sandbox.checkout.com"
 
 # Some sandbox clients have no webpage URL, and the network-tokens create rejects the body
 # without one (learned live: 422 primary_url_required). Sent in its place and flagged as a
@@ -455,6 +459,119 @@ class Reader:
         return ((d.get("_embedded") or {}).get(key) or []), code
 
 
+# ---------------------------------------------------------------- webhooks (Workflows)
+
+# Server-assigned ids (wf_/wfc_/wfa_) and links, stripped at EVERY level of a workflow —
+# unlike clean(), which is top-level only. Contract confirmed via checkout-mcp-sandbox:
+# GET /workflows -> {"data": [{id, name, active, _links}]}; GET /workflows/{id} -> {id, name,
+# active, conditions: [{id, type, ...}], actions: [{id, type, url, headers, signature, ...}]}.
+# POST /workflows accepts the same shape minus ids (add-workflow-request), nested.
+WORKFLOW_DROP = {"id", "_links"}
+# condition type -> the field carrying source ids that must be remapped on the clone
+WORKFLOW_SCOPED_CONDITIONS = {"entity": "entities", "processing_channel": "processing_channels"}
+
+
+def read_workflows(reader):
+    """Read every workflow of the client whose secret key the reader carries.
+
+    Returns (workflows, source): the workflow DETAILS (the list carries only id/name/active,
+    so each is fetched again) and a label — "sandbox-api" when read, "unavailable" when the
+    list call failed (a bad key gives 401; the reader records the error). The list is a
+    bare {"data": [...]}, not HAL, so Reader.hal does not apply.
+    """
+    d, code = reader.get("/workflows")
+    if not (200 <= code < 300) or not isinstance(d, dict):
+        return None, "unavailable"
+    out = []
+    for item in d.get("data") or []:
+        wid = item.get("id") if isinstance(item, dict) else None
+        det, c2 = reader.get(f"/workflows/{wid}") if wid else ({}, 0)
+        out.append(det if (200 <= c2 < 300 and isinstance(det, dict) and det) else item)
+    return out, "sandbox-api"
+
+
+def workflow_create_body(wf, entity_ids, channel_ids):
+    """Turn a source workflow detail into an add-workflow-request body.
+
+    Returns (body, requires, notes, emptied). Ids and _links are stripped at every level;
+    entity and processing-channel conditions are remapped to placeholders for the clone's
+    ids, and any id outside the capture's scope is dropped with a note. `emptied` names a
+    condition type whose id list became empty — such a workflow must not be created (the
+    request requires at least one id, and the intent cannot be honoured). Event conditions,
+    the webhook action's url, headers and signature are carried as-is: for a sandbox ->
+    sandbox clone they ARE the configuration; build_plan flags the url so the operator
+    confirms the receiver.
+    """
+    body = {k: v for k, v in (wf or {}).items() if k not in WORKFLOW_DROP and v is not None}
+    requires, notes, emptied = [], [], None
+    conds = []
+    for c in body.get("conditions") or []:
+        c = {k: v for k, v in c.items() if k not in WORKFLOW_DROP}
+        field = WORKFLOW_SCOPED_CONDITIONS.get(c.get("type"))
+        if field:
+            known = entity_ids if field == "entities" else channel_ids
+            kept = [s for s in (c.get(field) or []) if s in known]
+            dropped = [s for s in (c.get(field) or []) if s not in known]
+            if dropped:
+                notes.append(f"{c.get('type')} condition: dropped {', '.join(dropped)} — "
+                             f"not in this capture's scope")
+            if not kept:
+                emptied = emptied or c.get("type")
+            c[field] = [ph(s) for s in kept]
+            requires.extend(kept)
+        conds.append(c)
+    body["conditions"] = conds
+    body["actions"] = [{k: v for k, v in a.items() if k not in WORKFLOW_DROP}
+                       for a in body.get("actions") or []]
+    return body, requires, notes, emptied
+
+
+# ---------------------------------------------------------------- API keys (destination)
+#
+# The destination client gets its own API keys minted INSIDE the run, so nothing has to be
+# pasted for it (verified against Patrick's live calls, 2026-09-08):
+#   1. POST /clients/{id}/public-keys            {name, type: "RSA", key: <PKCS#1 PEM>}
+#      -> {id}                                    a public CRYPTO key CAT encrypts secrets with
+#   2. POST /clients/{id}/standalone-reference-tokens
+#        {description, scopes[], public_key_id, entity_id, allow_any_processing_channel,
+#         processing_channel_ids: []}             -> {id, temporary_secret}
+#      once with every "secret"-side scope (the secret key), once with every "public"-side
+#      scope (the public key). temporary_secret is the key RSA-encrypted with (1).
+# The keypair is generated at APPLY time by clone_apply (clone_keys), which substitutes the
+# PEM for PUBLIC_KEY_PEM_PLACEHOLDER, decrypts the two secrets, uses the secret key for the
+# webhook steps in the same run, and returns both values once. The plan never holds a key.
+# A literal marker, NOT a {{placeholder}}: the id map never holds key material, and a dry
+# run must not report it as unresolved. clone_apply swaps it for the run's PEM.
+PUBLIC_KEY_PEM_MARKER = "<<RUN_PUBLIC_KEY_PEM>>"
+# The id-map token for the crypto key's CAT id. Shaped like a source id (prefix_26) so the
+# dry run's synthetic id has CAT's shape like every other; no real object has this id.
+PUBLIC_CRYPTO_KEY_PROVIDES = "pck_runpubliccryptokeyxxxxxxxx"
+API_KEY_DESCRIPTIONS = {"client_api_secret_key": "CAT SETUP SECRET",
+                        "client_api_public_key": "CAT SET UP PUB"}
+
+
+def api_key_scopes_from(config):
+    """{"secret": [...], "public": [...]} from GET /access-keys/configuration, or None if the
+    response is not the scope catalogue. Values are the scope names CAT accepts."""
+    scopes = (config or {}).get("scopes") if isinstance(config, dict) else None
+    if not isinstance(scopes, list) or not scopes:
+        return None
+    out = {"secret": [], "public": []}
+    for s in scopes:
+        if not isinstance(s, dict):
+            continue
+        side, val = s.get("side_label"), s.get("value") or s.get("label")
+        if side in out and isinstance(val, str) and val:
+            out[side].append(val)
+    return out if out["secret"] and out["public"] else None
+
+
+def public_crypto_key_name():
+    """'PUB KEY CAT SETUP nnnnn' — CAT wants a unique name per key, hence the random suffix."""
+    import random
+    return f"PUB KEY CAT SETUP {random.randint(10000, 99999)}"
+
+
 # ---------------------------------------------------------------- capture
 
 def scope_entities(ents, only_entity=None, only_entities=None):
@@ -476,7 +593,8 @@ def scope_entities(ents, only_entity=None, only_entities=None):
     return kept, [w for w in wanted if w not in found]
 
 
-def capture(base, token, client_id, only_entity=None, only_entities=None):
+def capture(base, token, client_id, only_entity=None, only_entities=None,
+            sandbox_secret_key=None, sandbox_api_base=SANDBOX_API_BASE):
     """Read the source configuration. Returns a raw capture dict.
 
     only_entities: restrict the capture (and therefore the plan) to these ent_* ids — the
@@ -484,6 +602,10 @@ def capture(base, token, client_id, only_entity=None, only_entities=None):
     Useful for a first live run — same information, much smaller blast radius, and it
     matters because most of what a clone creates cannot be deleted afterwards. Requested
     ids CAT did not return are recorded in cap["scope_missing"] for the caller to refuse.
+
+    sandbox_secret_key: the SOURCE client's sk_sbox_ key. With it, the client's webhooks
+    (Workflows) are read from the Checkout sandbox API into cap["workflows"]; without it
+    they are not read, cap["workflows_source"] is "no_key", and the plan flags that.
     """
     r = Reader(base, token)
     cap = {"client_id": client_id, "entities": [], "only_entity": only_entity,
@@ -645,6 +767,23 @@ def capture(base, token, client_id, only_entity=None, only_entities=None):
         if cur[k] is not None:
             cur[k] = sorted(cur[k])
     cap["valid_currencies"] = cur
+
+    # API-key scope catalogue: which scopes a secret key and a public key may carry. Read
+    # here (the catalogue is CAT-wide; the clientId is only required by the route) so the
+    # plan can mint the destination's two keys with every scope of the right side —
+    # Patrick's known-good calls used exactly that. side_label is "secret" or "public".
+    d, code = r.get(f"/access-keys/configuration?clientId={client_id}")
+    cap["api_key_scopes"] = api_key_scopes_from(d) if 200 <= code < 300 else None
+
+    # Webhooks: the one read against the Checkout sandbox API rather than CAT. Needs the
+    # source's secret key; a missing key is recorded, never guessed around.
+    if sandbox_secret_key:
+        rw = Reader(sandbox_api_base, sandbox_secret_key)
+        cap["workflows"], cap["workflows_source"] = read_workflows(rw)
+        r.calls += rw.calls
+        r.errors.extend(rw.errors)
+    else:
+        cap["workflows"], cap["workflows_source"] = None, "no_key"
 
     cap["_meta"] = {"calls": r.calls, "errors": r.errors}
     return cap
@@ -1093,11 +1232,17 @@ def build_plan(cap, target_client_name=None):
 
     def add(kind, method, path, body, provides=None, requires=(), op=None, notes=None,
             entity=None, label=None, parent=None, provides_from=None, retry=None,
-            verify=None, optional=False, base=None):
+            verify=None, optional=False, base=None, auth=None):
         steps.append({"seq": len(steps) + 1, "kind": kind, "op": op, "method": method,
                       "path": path, "body": body,
                       "provides": provides, "requires": sorted(set(requires)),
                       "notes": notes or [],
+                      # auth: which credential sends this step. None/"cat" = the CAT
+                      # token; "sandbox_secret" = the DESTINATION client's sk_sbox_ against
+                      # the Checkout sandbox API (clone_apply.bearer_for). A step that
+                      # names a key the operator has not supplied is blocked, never sent
+                      # with the CAT token.
+                      "auth": auth,
                       # provides_from: dotted path to pull the id out of the response when
                       # it is not the top-level `id`. retry: for ids CAT provisions
                       # asynchronously on the target.
@@ -1959,6 +2104,129 @@ def build_plan(cap, target_client_name=None):
 
     _network_tokens_steps()
 
+    def _api_key_steps():
+        # 11b — the destination's API keys, minted in the run (see the API keys block near
+        # the top). Three CAT steps, all OPTIONAL: the CAT clone is complete without them,
+        # but the webhook steps that follow need the secret key — clone_apply feeds the
+        # decrypted value straight into sandbox_keys["sandbox_secret"] so they run in the
+        # same pass without the operator pasting anything. Placed after every entity
+        # because the secret key names an entity, exactly as the known-good call did.
+        scopes = cap.get("api_key_scopes")
+        if not scopes:
+            flag(make_flag(
+                "api_keys_not_planned",
+                "DESTINATION API KEYS NOT CREATED — the scope catalogue "
+                "(/access-keys/configuration) could not be read, so the secret and public "
+                "keys must be created by hand; paste the secret key as the Destination "
+                "Sandbox Secret Key before applying if webhooks should be cloned",
+                kind="client", object_id=src_cli, action="not_created"))
+            return
+        if not cap["entities"]:
+            return
+        first_eid = cap["entities"][0]["id"]
+        add("client_public_crypto_key", "POST", f"/clients/{ph(src_cli)}/public-keys",
+            {"name": public_crypto_key_name(), "type": "RSA",
+             "key": PUBLIC_KEY_PEM_MARKER},
+            provides=PUBLIC_CRYPTO_KEY_PROVIDES, requires=[src_cli],
+            op="PublicCryptoKeys_Create", optional=True,
+            label="register the run's RSA public key on the clone",
+            notes=["the keypair is generated by clone_apply at apply time; the private "
+                   "half never leaves the process"])
+        add("client_api_secret_key", "POST",
+            f"/clients/{ph(src_cli)}/standalone-reference-tokens",
+            {"description": API_KEY_DESCRIPTIONS["client_api_secret_key"],
+             "scopes": list(scopes["secret"]),
+             "public_key_id": ph(PUBLIC_CRYPTO_KEY_PROVIDES),
+             "entity_id": ph(first_eid), "allow_any_processing_channel": True,
+             "processing_channel_ids": []},
+            requires=[src_cli, PUBLIC_CRYPTO_KEY_PROVIDES, first_eid],
+            op="StandaloneReferenceTokens_Create", optional=True,
+            label=API_KEY_DESCRIPTIONS["client_api_secret_key"],
+            notes=[f"{len(scopes['secret'])} secret-side scopes; the returned "
+                   f"temporary_secret is decrypted in-run and used for the webhook steps"])
+        add("client_api_public_key", "POST",
+            f"/clients/{ph(src_cli)}/standalone-reference-tokens",
+            {"description": API_KEY_DESCRIPTIONS["client_api_public_key"],
+             "scopes": list(scopes["public"]),
+             "public_key_id": ph(PUBLIC_CRYPTO_KEY_PROVIDES),
+             "entity_id": "", "allow_any_processing_channel": True,
+             "processing_channel_ids": []},
+            requires=[src_cli, PUBLIC_CRYPTO_KEY_PROVIDES],
+            op="StandaloneReferenceTokens_Create", optional=True,
+            label=API_KEY_DESCRIPTIONS["client_api_public_key"],
+            notes=[f"{len(scopes['public'])} public-side scopes"])
+
+    _api_key_steps()
+
+    def _webhook_steps():
+        # 12 — Webhooks (Workflows). Not a CAT resource: read from the Checkout sandbox API
+        # with the SOURCE client's secret key (capture), created there with the DESTINATION
+        # client's (auth="sandbox_secret") — so the destination's access keys must exist
+        # before these steps can run. Every step is OPTIONAL: nothing downstream depends on
+        # a webhook, so a blocked (no key) or failed one is a flag and the CAT clone still
+        # completes. Last in the plan because conditions reference entity/channel ids the
+        # run mints earlier.
+        wfs, src = cap.get("workflows"), cap.get("workflows_source")
+        if wfs is None:
+            if src == "no_key":
+                flag(make_flag(
+                    "webhooks_not_read",
+                    "WEBHOOKS WERE NOT READ — supply the Source Sandbox Secret Key and "
+                    "capture again to clone them, or create them by hand on the "
+                    "destination client",
+                    kind="client", object_id=src_cli, action="not_checked"))
+            else:
+                flag(make_flag(
+                    "webhooks_unavailable",
+                    "webhooks: the sandbox API refused or failed the workflows read (see "
+                    "the capture's errors — a 401 means the Source Sandbox Secret Key is "
+                    "not this client's). Nothing cloned; create them by hand or fix the "
+                    "key and capture again.",
+                    kind="client", object_id=src_cli,
+                    errors=[e for e in (cap.get("_meta") or {}).get("errors", [])
+                            if "/workflows" in str(e.get("path", ""))],
+                    action="not_created"))
+            return
+        ent_ids = {e["id"] for e in cap["entities"]}
+        ch_ids = {c["id"] for e in cap["entities"]
+                  for c in (e.get("processing_channels") or []) if c.get("id")}
+        expected = []
+        for wf in wfs:
+            name = wf.get("name") or wf.get("id") or "unnamed workflow"
+            body, req, notes, emptied = workflow_create_body(wf, ent_ids, ch_ids)
+            if emptied:
+                skipped.append({"kind": "webhook_workflow",
+                                "reason": f"workflow '{name}': every id in its {emptied} "
+                                          f"condition is outside this capture's scope"})
+                flag(make_flag(
+                    "webhook_scope_emptied",
+                    f"webhook workflow '{name}' is not created: its {emptied} condition "
+                    f"names only objects outside this capture's scope",
+                    kind="webhook_workflow", object_id=wf.get("id"), action="not_created"))
+                continue
+            for a in body["actions"]:
+                if a.get("type") == "webhook" and a.get("url"):
+                    flag(make_flag(
+                        "webhook_url_carried",
+                        f"webhook workflow '{name}' will deliver to {a['url']} — the "
+                        f"source's receiver, carried as-is with its headers and signing "
+                        f"key. Confirm that is the intended endpoint for the clone.",
+                        kind="webhook_workflow", object_id=wf.get("id"), url=a["url"],
+                        action="carried"))
+            add("webhook_workflow", "POST", "/workflows", body, requires=req,
+                op="Workflows_Add", notes=notes, label=name, optional=True,
+                auth="sandbox_secret")
+            expected.append(name)
+        if expected:
+            # Read the clone's workflows back and compare by name — a 201 per create is
+            # not proof the set is complete (same reasoning as payout_route_check).
+            add("webhook_check", "GET", "/workflows", {}, op="Workflows_GetAll",
+                label="read back the clone's webhook workflows", optional=True,
+                auth="sandbox_secret",
+                verify={"compare": "workflows", "expected": expected})
+
+    _webhook_steps()
+
     # not attempted in this pass — recorded explicitly rather than silently omitted
     for k, why in (("pay_to_card_entity", "GET /pay-to-card-entity returns 503"),
                    ("pay_to_card_schemes", "depends on pay-to-card entity profile"),
@@ -1989,6 +2257,10 @@ def build_plan(cap, target_client_name=None):
     return {
         "plan_version": PLAN_VERSION,
         "generated_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # how the webhooks read went: "sandbox-api" (count in webhooks_read), "no_key",
+        # or "unavailable" — the page shows this on the Capture tab
+        "webhooks_source": cap.get("workflows_source"),
+        "webhooks_read": len(cap["workflows"]) if isinstance(cap.get("workflows"), list) else None,
         "source": {"client_id": src_cli, "client_name": client.get("name"),
                    "entities": [e["id"] for e in cap["entities"]]},
         "target": {"client_name": target_client_name, "mode": "new_client"},

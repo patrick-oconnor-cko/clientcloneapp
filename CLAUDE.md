@@ -14,9 +14,22 @@ that are expensive to rediscover.
 - **Verbs are allowlisted to `{GET, POST, PUT}`** in `clone_apply.ALLOWED_METHODS`. Do not add
   `DELETE` — removal belongs to `clone_cleanup.py` behind its own gate.
 - **Sandbox API keys are manual, optional and sandbox-only.** `server.sandbox_keys` refuses
-  anything not prefixed `sk_sbox_`/`pk_sbox_`. A step reaches the sandbox API only by
-  declaring `auth: "sandbox_secret"|"sandbox_public"`; without the key it is blocked, never
-  sent with the CAT token. The CAT token is always pasted by Patrick; nothing obtains one.
+  anything not prefixed `sk_sbox_`/`pk_sbox_`. Two secret keys with two roles: the
+  **source** key (`sandbox_sk`) only ever reads (webhooks at capture); the **destination**
+  key (`dest_sandbox_sk`) is what `auth: "sandbox_secret"` steps are sent with. Without the
+  destination key such a step is blocked (optional → flagged, run continues), never sent
+  with the CAT token or the source key. The CAT token is always pasted by Patrick; nothing
+  obtains one.
+- **The clone's API keys are minted in the run and never journalled.** CAT returns a key's
+  secret RSA-encrypted with a public crypto key on the client; `clone_keys` (stdlib) makes
+  the keypair at apply time, `clone_apply` decrypts, feeds the secret to the webhook steps
+  and returns both plaintexts ONCE in `run["destination_keys"]`. Response excerpts redact
+  `temporary_secret`/`secret`; the plan carries the literal `<<RUN_PUBLIC_KEY_PEM>>`
+  marker, never key material. Keep it that way.
+- **Webhooks are Workflows in the Checkout sandbox API, not CAT.** `clean()` does not reach
+  their nested ids; `workflow_create_body` strips `id`/`_links` at every level and remaps
+  entity/channel conditions. A condition left empty by scoping means skip + flag, never a
+  widened match.
 - **Processing channels and processors can be neither deleted nor deactivated.** Every live run
   leaves a permanent record in sandbox. Prefer scoping a run to one entity.
 - **Never run a live apply or cleanup without being asked explicitly.** A dry run is always

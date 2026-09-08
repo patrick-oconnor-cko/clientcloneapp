@@ -27,10 +27,18 @@ CAT_BASE = "https://client-admin.cko-sbox.ckotech.co/api"
 # real created-object ids from a write run.
 RUNS_DIR = HERE.parent / "clone-runs"
 
-# The optional Checkout sandbox API keys, typed into the page each session alongside the
-# CAT token: (request field, clone_apply auth mode, required prefix, label on the page).
-SANDBOX_KEY_FIELDS = (("sandbox_sk", "sandbox_secret", "sk_sbox_", "Sandbox Secret Key"),
-                      ("sandbox_pk", "sandbox_public", "pk_sbox_", "Sandbox Public Key"))
+# The optional Checkout sandbox API keys, alongside the CAT token:
+# (request field, key role, required prefix, label on the page). Two secret keys because a
+# webhook clone reads the SOURCE client's workflows and creates them on the DESTINATION:
+#   sandbox_sk       -> "source_sandbox_secret": read-only, used by capture (GET /workflows)
+#   dest_sandbox_sk  -> "sandbox_secret":        clone_apply's auth mode for sandbox-API
+#                       steps — the new client's key, which exists only once its access
+#                       keys have been created by hand
+#   sandbox_pk       -> "sandbox_public":        reserved for endpoints that take a public key
+SANDBOX_KEY_FIELDS = (
+    ("sandbox_sk", "source_sandbox_secret", "sk_sbox_", "Source Sandbox Secret Key"),
+    ("dest_sandbox_sk", "sandbox_secret", "sk_sbox_", "Destination Sandbox Secret Key"),
+    ("sandbox_pk", "sandbox_public", "pk_sbox_", "Sandbox Public Key"))
 
 
 def sandbox_keys(payload):
@@ -69,7 +77,9 @@ def clone_capture_handler(payload):
                             if isinstance(x, str) and x.strip()})
     cap  = cc.capture(CAT_BASE, token, client_id,
                       only_entity=(payload.get("only_entity") or "").strip() or None,
-                      only_entities=only_entities or None)
+                      only_entities=only_entities or None,
+                      # the SOURCE's secret key reads its webhooks; never the destination's
+                      sandbox_secret_key=keys.get("source_sandbox_secret"))
     # Persist the RAW capture, every time, before anything is derived from it. When a
     # plan skips something, the question is always "what did CAT actually return?" — and
     # until now the only answer was to ask someone to paste it. Gitignored with the

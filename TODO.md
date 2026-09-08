@@ -8,8 +8,15 @@
   finished. That step has since been removed (see below); a plan built from the same
   capture now yields **86 steps, none optional**. 3-entity reference client
   `cli_scna7ew7mxdenl3h36zlmkyh6m`.
-- **Tests:** `python3 tests/test_plan.py` → 227 pass. `python3 tests/mutation_check.py` →
-  107/107 mutants caught. Both need no token or network.
+- **Tests:** `python3 tests/test_plan.py` → 252 pass. `python3 tests/mutation_check.py` →
+  115/115 mutants caught. Both need no token or network. (The suite patches
+  `clone_keys.generate` to one shared 1024-bit key so live-mock applies stay fast.)
+- **Destination API keys minted in the run (2026-09-08), not yet run live** — see §00.7a.
+  The Destination Sandbox Secret Key box is now optional.
+- **Webhooks (sandbox → sandbox) built 2026-09-08, not yet run live** — see §00.7. Needs the
+  Source Sandbox Secret Key at capture and the Destination Sandbox Secret Key at apply;
+  without the latter the two webhook steps block with `optional_step_blocked` and the CAT
+  clone still completes.
 - **Three always-on manual-step warnings** on every plan, one line each: NETWORK TOKEN /
   RTAU / IA `SETTINGS MUST BE CREATED MANUALLY ON THE DESTINATION CLIENT`
   (`network_tokens_manual`, `rtau_manual`, `intelligent_acceptance_manual`).
@@ -97,32 +104,32 @@ None of them is flagged yet except pricing profiles (in `skipped[]`).
    not read the reporting-profile … services"), so a cloned client has none. Establish
    what "not working" means on the clone (missing entirely vs created but broken), then
    either clone it or raise a manual-step flag.
-7. **Webhooks — never built (checked 2026-09-04: no code, no history, no journal ever
-   mentioned them).** They are not in CAT. They live in the **client-facing Checkout API**
-   as Workflows, authenticated with a **secret key** — exactly the `auth: "sandbox_secret"`
-   seam `clone_apply` already has. Operations confirmed via the `checkout-mcp-sandbox` MCP
-   (Workflows tag, 21 operations): `getAllWorkflows` GET `/workflows`, `getWorkflow` GET
-   `/workflows/{workflowId}`, `addWorkflow` POST `/workflows`, `addWorkflowAction` POST
-   `/workflows/{id}/actions`, `addWorkflowCondition` POST `/workflows/{id}/conditions`,
-   `getEventTypes` GET `/workflows/event-types`; the webhook is a `webhook-action` schema
-   (`get-webhook-action` on read). Next: `get_operation` + `get_schema` on those to learn
-   whether `addWorkflow` accepts nested actions/conditions in one body and whether the
-   action's signing secret / headers are readable. Design points to settle before coding:
-   - **Two secret keys, not one.** Reading the source's workflows needs the *source*
-     client's `sk_sbox_`; creating them needs the *destination* client's. The destination
-     is brand new and has no access keys (already `skipped[]` as a manual step), so the
-     create steps must stay **blocked** — with a clear message — until the operator has
-     created the destination keys and pasted its secret key. The side panel probably needs
-     a source pair and a destination pair.
-   - **Capture side:** GET the source's workflows and each one's detail (conditions,
-     actions, signing/secret); actions carry the merchant's webhook URL and headers — carry
-     as-is, but the **signature secret / auth headers may be write-only or masked**; check
-     the GET before assuming they can be copied (same trap as `custom_settings.credentials`).
-   - **Plan side:** one `webhook_workflow` step per source workflow, `auth: "sandbox_secret"`,
-     base `api.sandbox.checkout.com`; entity/processing-channel ids inside workflow
-     conditions must be remapped through the id map like every other source id.
-   - **Verify:** read back `/workflows` on the destination and compare counts/names as a
-     run-time flag, like `payout_route_check`.
+7a. **Destination API keys — BUILT (2026-09-08), not yet run live.** The run registers an
+   RSA public key (`POST /clients/{id}/public-keys` `{name, type: "RSA", key}`), creates
+   `CAT SETUP SECRET` (all secret-side scopes) and `CAT SET UP PUB` (all public-side scopes)
+   via `POST /clients/{id}/standalone-reference-tokens`, decrypts the `temporary_secret`s
+   with `clone_keys`, uses the secret for the webhooks, shows both once. **Open:** first live
+   run confirms the public-key create body (swagger says `{name,type,key}`; the other
+   Access Key API wants `{name, public_key_ascii}` + `version=2` — CAT is the former) and
+   CAT's RSA padding (decryptor tries PKCS#1 v1.5 and OAEP-SHA1/256 and reports which).
+   If `create_public_key`/`create_access_key` permission is missing on the token the two
+   steps 403 — optional, so the run continues and the webhooks block.
+7. **Webhooks — BUILT for sandbox → sandbox (2026-09-08), not yet run live.** Workflows in
+   the Checkout sandbox API (contract via `checkout-mcp-sandbox`: `addWorkflow` accepts
+   nested `conditions[]` + `actions[]` in one POST; `get-webhook-action` returns `url`,
+   `headers` and `signature.key` in clear). What exists: `read_workflows` (capture, source
+   key), `workflow_create_body` (strips ids/_links at every level, remaps entity/channel
+   conditions, skips + flags a workflow whose scoped condition empties),
+   `webhook_workflow` / `webhook_check` steps (`auth: "sandbox_secret"`, `optional`),
+   `verify_workflows`, `optional_step_blocked` handling in `clone_apply`, the Source /
+   Destination Sandbox Secret Key fields. **Open:**
+   - **First live run.** Confirm `POST /workflows` accepts the carried body (headers +
+     signature copied). If CAT-style surprises appear, diff against the MCP schema.
+   - **Event-type validation** against `GET /workflows/event-types` on the destination
+     before creating (an event the destination does not offer would 422 the whole create).
+   - **Cleanup**: `DELETE /workflows/{id}` exists but needs the destination key; cleanup is
+     CAT-token only, so workflows are `mode: none` for now.
+   - **Prod → Sandbox**: needs a read-only prod key field and URL substitution (§00.5).
 
 ---
 
