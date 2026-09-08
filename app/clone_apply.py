@@ -460,6 +460,7 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
     sandbox_keys = dict(sandbox_keys or {})
     keypair = None            # the run's RSA keypair, generated when the crypto-key step runs
     destination_keys = {}     # role -> {kind, id, description, value, padding}; shown once
+    failed_labels = set()     # labels of steps that failed live — read-back checks skip them
     t_start = time.time()
     jrn = Journal(journal_path, {
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -649,7 +650,14 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                     entry["verify_error"] = f"unknown verifier {v.get('compare')!r}"
                     problems.append(f"step {seq} ({kind}): {entry['verify_error']}")
                 else:
-                    vflags, vsummary = fn(v.get("expected") or [], resp)
+                    expected = v.get("expected") or []
+                    if v.get("compare") == "workflows":
+                        # Only expect what this run actually created: a webhook whose own
+                        # create failed is already an optional_step_failed flag, and
+                        # reporting it "missing" as well is noise (first live run did that).
+                        expected = [n for n in expected if n not in failed_labels]
+                        entry["verify_expected"] = expected
+                    vflags, vsummary = fn(expected, resp)
                     for f in vflags:
                         f.setdefault("seq", seq); f.setdefault("entity", step.get("entity"))
                     entry["verify"] = vsummary
@@ -664,6 +672,8 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         else:
             entry["error"] = err
             failed += 1
+            if step.get("label"):
+                failed_labels.add(step["label"])
             if step.get("optional"):
                 # An OPTIONAL step is an enhancement nothing else depends on (network
                 # tokens, say). Its failure is a finding for the report, not a reason to

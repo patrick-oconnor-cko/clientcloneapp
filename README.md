@@ -422,12 +422,13 @@ profiles** (excluded by policy so far), **arrears** configuration, the **Prod �
 payout-schedule account details** callout, **reporting profiles**, and **webhooks**. Until
 each is built or ruled out it should become a one-line manual-step flag like the three above.
 
-**Webhooks are cloned for sandbox → sandbox, and the new client's API keys are minted in the
-run** (built 2026-09-08; see *Step order*). Not yet verified live: the first live run will
-settle (a) whether `POST /public-keys` accepts `{name, type, key}` as the swagger declares,
-(b) which RSA padding CAT uses — the decryptor tries both and says which — and (c) whether
-`POST /workflows` accepts the carried body unchanged. Prod → Sandbox webhooks (prod source
-key, URL substitution) are still open — TODO §00.5/§00.7.
+**The new client's API keys are minted in the run — verified live** (2026-09-08): the
+public-key create accepts `{name, type, key}`, CAT encrypts secrets with **PKCS#1 v1.5**, and
+the minted secret authenticated against the sandbox API in the same run. **Webhooks are
+built but not yet landing:** the first live run's four `POST /workflows` all returned 422
+`condition_entity_entity_id_invalid` with correctly remapped entity ids. Bodies are now
+allowlisted per level; whether the rest is propagation delay or an entity-scoping rule is
+being settled by hand — TODO §00.7. Prod → Sandbox webhooks remain open (§00.5).
 
 ---
 

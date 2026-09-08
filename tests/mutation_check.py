@@ -520,6 +520,12 @@ MUTATIONS = [
     ("webhook condition sends the SOURCE entity/channel ids", "app/clone_capture.py",
      '            c[field] = [ph(s) for s in kept]',
      '            c[field] = list(kept)'),
+    ("workflow read-only fields echoed into the create (allowlist dropped)", "app/clone_capture.py",
+     '        c = {k: v for k, v in c.items() if k in WORKFLOW_CONDITION_FIELDS}',
+     '        c = {k: v for k, v in c.items() if k not in ("id", "_links")}'),
+    ("read-back reports webhooks whose create already failed", "app/clone_apply.py",
+     '                        expected = [n for n in expected if n not in failed_labels]',
+     '                        pass'),
     ("webhook step sent with the CAT token (auth dropped)", "app/clone_capture.py",
      '                op="Workflows_Add", notes=notes, label=name, optional=True,\n'
      '                auth="sandbox_secret")',

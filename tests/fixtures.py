@@ -632,24 +632,27 @@ def _workflow(tag, name, entity_ids=(), channel_ids=(), url="https://merchant.ex
     and one webhook action carrying headers and a signing key."""
     wid = _id("wf", tag)
     link = lambda suffix: {"self": {"href": f"https://api.sandbox.checkout.com/workflows/{wid}{suffix}"}}
+    # every level carries created_at/updated_at on the real read (first live run) — the
+    # create must never see them
+    ts = {"created_at": "2025-11-28T12:07:46.996+00:00", "updated_at": "2026-07-20T09:01:10.52+00:00"}
     conds = [{"id": _id("wfc", tag + "ev"), "type": "event",
               "events": {"gateway": ["payment_approved", "payment_declined"],
                          "dispute": ["dispute_won"]},
-              "_links": link(f"/conditions/{_id('wfc', tag + 'ev')}")}]
+              "_links": link(f"/conditions/{_id('wfc', tag + 'ev')}"), **ts}]
     if entity_ids:
         conds.append({"id": _id("wfc", tag + "en"), "type": "entity",
                       "entities": list(entity_ids),
-                      "_links": link(f"/conditions/{_id('wfc', tag + 'en')}")})
+                      "_links": link(f"/conditions/{_id('wfc', tag + 'en')}"), **ts})
     if channel_ids:
         conds.append({"id": _id("wfc", tag + "pc"), "type": "processing_channel",
                       "processing_channels": list(channel_ids),
-                      "_links": link(f"/conditions/{_id('wfc', tag + 'pc')}")})
+                      "_links": link(f"/conditions/{_id('wfc', tag + 'pc')}"), **ts})
     return {"id": wid, "name": name, "active": active, "conditions": conds,
             "actions": [{"id": _id("wfa", tag), "type": "webhook", "url": url,
                          "headers": {"Authorization": "src-auth-" + tag},
                          "signature": {"method": "HMACSHA256", "key": "src-signing-" + tag},
-                         "_links": link(f"/actions/{_id('wfa', tag)}")}],
-            "_links": link("")}
+                         "_links": link(f"/actions/{_id('wfa', tag)}"), **ts}],
+            "_links": link(""), **ts}
 
 
 def webhooks_capture():

@@ -2205,8 +2205,14 @@ class TestWebhooks(unittest.TestCase):
         wf = self.cap["workflows"][0]
         body, req, notes, emptied = cc.workflow_create_body(wf, {self.eid}, {self.pcid})
         blob = json.dumps(body)
-        for prefix in ("wf_", "wfc_", "wfa_", "_links"):
+        for prefix in ("wf_", "wfc_", "wfa_", "_links", "created_at", "updated_at"):
             self.assertNotIn(prefix, blob, prefix)
+        # allowlisted shape at every level — exactly what add-workflow-request declares
+        self.assertEqual(set(body), {"name", "active", "conditions", "actions"})
+        for c in body["conditions"]:
+            self.assertTrue(set(c) <= cc.WORKFLOW_CONDITION_FIELDS, c)
+        for a in body["actions"]:
+            self.assertTrue(set(a) <= cc.WORKFLOW_ACTION_FIELDS, a)
         self.assertEqual(body["name"], "Payments webhook")
         ents = next(c for c in body["conditions"] if c["type"] == "entity")
         pcs = next(c for c in body["conditions"] if c["type"] == "processing_channel")
@@ -2322,6 +2328,28 @@ class TestWebhooks(unittest.TestCase):
         self.assertEqual(run["counts"]["failed"], 0)
         self.assertFalse(any(f["code"] == "webhook_missing_on_clone" for f in run["flags"]))
         self.assertNotIn(self.SRC_SK, json.dumps(run)); self.assertNotIn(self.DEST_SK, json.dumps(run))
+
+    def test_read_back_does_not_report_a_webhook_whose_own_create_failed(self):
+        # First live run: four creates 422'd, then the read-back flagged all four as
+        # "missing" too. The create failure is already a flag; the check must only expect
+        # what this run created.
+        def fake_send(base, bearer, method, path, body=None, **kw):
+            if path == "/workflows" and method == "POST":
+                return {}, 422, '{"error_codes":["condition_entity_entity_id_invalid"]}'
+            if path == "/workflows":
+                return {"data": []}, 200, None
+            return {"id": "x_" + str(len(path))}, 201, None
+        with mock.patch.object(capp, "_send", side_effect=fake_send), \
+             mock.patch("time.sleep", lambda *a, **k: None):
+            run = capp.apply_plan(self.plan, base="https://cat", token="cat-token",
+                                  dry_run=False, pace_seconds=0,
+                                  sandbox_keys={"sandbox_secret": self.DEST_SK})
+        codes = [f["code"] for f in run["flags"]]
+        self.assertIn("optional_step_failed", codes)
+        self.assertNotIn("webhook_missing_on_clone", codes)
+        chk = next(e for e in run["journal"] if e["kind"] == "webhook_check")
+        self.assertEqual(chk["verify_expected"], [])
+        self.assertEqual(chk["verify"]["expected"], 0)
 
     def test_read_back_flags_a_workflow_the_clone_does_not_list(self):
         flags, summary = capp.verify_workflows(["A", "B"], {"data": [{"name": "A"}, {"name": "Z"}]})

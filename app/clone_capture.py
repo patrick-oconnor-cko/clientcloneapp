@@ -466,7 +466,14 @@ class Reader:
 # GET /workflows -> {"data": [{id, name, active, _links}]}; GET /workflows/{id} -> {id, name,
 # active, conditions: [{id, type, ...}], actions: [{id, type, url, headers, signature, ...}]}.
 # POST /workflows accepts the same shape minus ids (add-workflow-request), nested.
-WORKFLOW_DROP = {"id", "_links"}
+WORKFLOW_DROP = {"id", "_links", "created_at", "updated_at"}
+# What the CREATE accepts at each level (add-workflow-request via checkout-mcp-sandbox). An
+# ALLOWLIST, not a drop-list: the first live run (2026-09-08) showed the read carries
+# created_at/updated_at on every condition and action, and anything else the read grows
+# would otherwise be echoed back into a create that never asked for it.
+WORKFLOW_FIELDS = {"name", "active", "conditions", "actions"}
+WORKFLOW_CONDITION_FIELDS = {"type", "events", "entities", "processing_channels"}
+WORKFLOW_ACTION_FIELDS = {"type", "url", "headers", "signature"}
 # condition type -> the field carrying source ids that must be remapped on the clone
 WORKFLOW_SCOPED_CONDITIONS = {"entity": "entities", "processing_channel": "processing_channels"}
 
@@ -502,11 +509,11 @@ def workflow_create_body(wf, entity_ids, channel_ids):
     sandbox clone they ARE the configuration; build_plan flags the url so the operator
     confirms the receiver.
     """
-    body = {k: v for k, v in (wf or {}).items() if k not in WORKFLOW_DROP and v is not None}
+    body = {k: v for k, v in (wf or {}).items() if k in WORKFLOW_FIELDS and v is not None}
     requires, notes, emptied = [], [], None
     conds = []
     for c in body.get("conditions") or []:
-        c = {k: v for k, v in c.items() if k not in WORKFLOW_DROP}
+        c = {k: v for k, v in c.items() if k in WORKFLOW_CONDITION_FIELDS}
         field = WORKFLOW_SCOPED_CONDITIONS.get(c.get("type"))
         if field:
             known = entity_ids if field == "entities" else channel_ids
@@ -521,7 +528,7 @@ def workflow_create_body(wf, entity_ids, channel_ids):
             requires.extend(kept)
         conds.append(c)
     body["conditions"] = conds
-    body["actions"] = [{k: v for k, v in a.items() if k not in WORKFLOW_DROP}
+    body["actions"] = [{k: v for k, v in a.items() if k in WORKFLOW_ACTION_FIELDS}
                        for a in body.get("actions") or []]
     return body, requires, notes, emptied
 

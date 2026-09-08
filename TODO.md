@@ -104,17 +104,24 @@ None of them is flagged yet except pricing profiles (in `skipped[]`).
    not read the reporting-profile … services"), so a cloned client has none. Establish
    what "not working" means on the clone (missing entirely vs created but broken), then
    either clone it or raise a manual-step flag.
-7a. **Destination API keys — BUILT (2026-09-08), not yet run live.** The run registers an
-   RSA public key (`POST /clients/{id}/public-keys` `{name, type: "RSA", key}`), creates
-   `CAT SETUP SECRET` (all secret-side scopes) and `CAT SET UP PUB` (all public-side scopes)
-   via `POST /clients/{id}/standalone-reference-tokens`, decrypts the `temporary_secret`s
-   with `clone_keys`, uses the secret for the webhooks, shows both once. **Open:** first live
-   run confirms the public-key create body (swagger says `{name,type,key}`; the other
-   Access Key API wants `{name, public_key_ascii}` + `version=2` — CAT is the former) and
-   CAT's RSA padding (decryptor tries PKCS#1 v1.5 and OAEP-SHA1/256 and reports which).
-   If `create_public_key`/`create_access_key` permission is missing on the token the two
-   steps 403 — optional, so the run continues and the webhooks block.
-7. **Webhooks — BUILT for sandbox → sandbox (2026-09-08), not yet run live.** Workflows in
+7a. **Destination API keys — BUILT and VERIFIED LIVE (run `clone-20260908T140150Z`).**
+   `POST /clients/{id}/public-keys` `{name, type: "RSA", key: <PKCS#1 PEM>}` → 201;
+   `POST /clients/{id}/standalone-reference-tokens` → 201 with `temporary_secret`; both
+   decrypted with **PKCS#1 v1.5** (confirmed — the decryptor still tries OAEP as a
+   fallback); the minted secret authenticated `GET /workflows` on the clone (200). Nothing
+   to paste for the destination any more.
+7. **Webhooks — BUILT; first live run (2026-09-08T14:01Z) created 0 of 4.** Every
+   `POST /workflows` returned 422 `condition_entity_entity_id_invalid`. The journal shows
+   the entity ids sent WERE the clone's new ids (remapping correct), sent ~22s after the
+   last entity create. Fixed since: bodies are now an allowlist per level (the read carried
+   `created_at`/`updated_at` on every condition/action) and the read-back no longer
+   re-reports a webhook whose create failed. **Still open — settle with two manual POSTs**
+   (bodies in `clone-runs/webhook90_clean.json` and `…_no_entity.json`, sent with the
+   minted destination key): if the clean body succeeds later, it was propagation → add a
+   retry (like `vault_lookup`) to `webhook_workflow`; if only the no-entity body succeeds,
+   the entity condition is the constraint (key scoped to `entity_id`? entities not yet
+   known to the Workflows service?) → try minting the secret key with `entity_id: ""`.
+   Workflows in
    the Checkout sandbox API (contract via `checkout-mcp-sandbox`: `addWorkflow` accepts
    nested `conditions[]` + `actions[]` in one POST; `get-webhook-action` returns `url`,
    `headers` and `signature.key` in clear). What exists: `read_workflows` (capture, source
