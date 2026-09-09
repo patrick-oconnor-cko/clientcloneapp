@@ -74,6 +74,29 @@ DRY_RUN_PEM = ("-----BEGIN RSA PUBLIC KEY-----\n(generated at live apply; never 
                "-----END RSA PUBLIC KEY-----\n")
 
 
+def set_path(obj, dotted, value):
+    """Set obj[a][b][c] = value for "a.b.c", creating intermediate dicts."""
+    parts = dotted.split(".")
+    cur = obj
+    for p in parts[:-1]:
+        nxt = cur.get(p)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[p] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+
+
+def has_path(obj, dotted):
+    """True if "a.b.c" resolves to a present, non-empty value in obj."""
+    cur = obj
+    for p in dotted.split("."):
+        if not isinstance(cur, dict) or p not in cur:
+            return False
+        cur = cur[p]
+    return cur not in (None, "", {}, [])
+
+
 def redact_secrets(obj):
     """Copy of a response with any secret-bearing field replaced, for journalling."""
     if isinstance(obj, dict):
@@ -374,7 +397,38 @@ def verify_workflows(expected, resp):
                    "missing": missing, "on_clone": len(have)}
 
 
-VERIFIERS = {"payout_routes": verify_payout_routes,
+def verify_prism_service(expected, resp):
+    """The clone entity's prism service, read back before its channels are created.
+
+    expected: {"client": <clone client id>, "entity": <clone entity id>} — placeholders in
+    the plan, resolved by apply. Flags when the service is not enabled or the key CAT
+    minted does not name that client|entity. The channel steps that reference the key are
+    blocked automatically if no key came back (their placeholder never resolves) — a
+    channel is never sent with a key that does not belong to the clone.
+    """
+    prism = resp.get("prism") if isinstance(resp, dict) else None
+    prism = prism if isinstance(prism, dict) else {}
+    key, enabled = prism.get("prism_key"), prism.get("is_enabled")
+    exp = expected if isinstance(expected, dict) else {}
+    want = (f"{exp['client']}|{exp['entity']}" if exp.get("client") and exp.get("entity")
+            else None)
+    flags = []
+    if not enabled:
+        flags.append({"code": "prism_service_not_enabled", "kind": "prism_service_check",
+                      "action": "not_created",
+                      "message": "the prism service is not enabled on the clone's entity when "
+                                 "read back — channels referencing it would be refused with "
+                                 "invalid_prism_merchant_service"})
+    if key and want and key != want:
+        flags.append({"code": "prism_key_unexpected", "kind": "prism_service_check",
+                      "prism_key": key, "expected": want, "action": "carried",
+                      "message": f"the clone's prism key {key} does not name this clone's "
+                                 f"client|entity ({want}); channels use the key CAT returned"})
+    return flags, {"enabled": bool(enabled), "prism_key": key, "expected": want,
+                   "matches": bool(key and want and key == want)}
+
+
+VERIFIERS = {"payout_routes": verify_payout_routes, "prism_service": verify_prism_service,
              "workflows": verify_workflows,
              "compass_settings": verify_compass_settings,
              "network_tokens": verify_network_tokens}
@@ -397,9 +451,13 @@ class Journal:
     still leaves a complete record of what was created — which matters because CAT
     offers no rollback, so this file is the only basis for cleanup or resume.
     """
-    def __init__(self, path=None, header=None):
+    def __init__(self, path=None, header=None, redact=None):
         self.path = path
         self.fh = None
+        # redact: callable applied to every line before it is written — set for a
+        # Prod -> Sandbox run so production values never reach the file (bodies carry
+        # them; the in-memory journal the page receives is left as-is).
+        self.redact = redact
         if path:
             p = pathlib.Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -408,6 +466,8 @@ class Journal:
 
     def _write(self, obj):
         if self.fh:
+            if self.redact:
+                obj = self.redact(obj)
             self.fh.write(json.dumps(obj) + "\n")
             self.fh.flush()
             os.fsync(self.fh.fileno())
@@ -423,7 +483,7 @@ class Journal:
 
 def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                pace_seconds=0.35, manual_values=None, journal_path=None,
-               sandbox_keys=None, on_step=None):
+               sandbox_keys=None, on_step=None, redact=None):
     """Execute or simulate a clone plan.
 
     on_step: optional callable(entry, total_steps), invoked once per step as its journal
@@ -475,7 +535,10 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         "plan_skipped": plan.get("skipped") or [],
         "plan_counts": plan.get("counts") or {},
         # WHICH keys were supplied, never their values — the journal is a durable file.
-        "sandbox_keys_supplied": sorted(k for k, v in (sandbox_keys or {}).items() if v)})
+        "sandbox_keys_supplied": sorted(k for k, v in (sandbox_keys or {}).items() if v),
+        # where the source was read from; a "prod" source means every line is redacted
+        "source_env": (plan.get("source") or {}).get("env") or "sandbox",
+        "redacted": bool(redact)}, redact=redact)
     total_steps = len(plan.get("steps", []))
 
     def record(entry):
@@ -491,11 +554,14 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         seq, kind = step["seq"], step["kind"]
         body = dict(step.get("body") or {})
 
-        # merge any hand-supplied values for this step
+        # merge any hand-supplied values for this step — "<seq>.<dotted.path>"; nested
+        # paths create the intermediate objects (payment_instrument.bank_details, …)
         for key, val in manual_values.items():
             s, _, field = key.partition(".")
             if s.isdigit() and int(s) == seq and field:
-                body[field] = val
+                set_path(body, field, val)
+        # values the plan says the operator MUST supply (production data never carried)
+        missing_manual = [p for p in (step.get("needs_manual") or []) if not has_path(body, p)]
 
         path = substitute(step["path"], id_map)
         body = substitute(body, id_map)
@@ -522,6 +588,22 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         if miss:
             entry.update(status="blocked", error=f"unresolved placeholders: {', '.join(miss)}")
             problems.append(f"step {seq} ({kind}): unresolved {', '.join(miss)}")
+        elif missing_manual:
+            # Production data the plan refused to carry (bank details) — the operator has
+            # to supply a sandbox value as manual_values "<seq>.<path>". Never optional:
+            # the decision was "blocked until supplied", not "skipped".
+            err = ("needs values you must supply — production data is not carried: "
+                   + ", ".join(missing_manual)
+                   + f". Add them as manual values ({seq}.<path>) and apply again.")
+            entry.update(status="blocked", error=err, needs_manual=missing_manual)
+            problems.append(f"step {seq} ({kind}): {err}")
+            f = {"code": "manual_value_required", "kind": kind, "seq": seq,
+                 "entity": step.get("entity"), "fields": missing_manual,
+                 "action": "not_supplied",
+                 "message": f"step {seq} ({kind}) is blocked: {err}"}
+            entry["flags"] = [f]
+            run_flags.append(f)
+            miss = missing_manual   # takes the same hard-stop path below
         elif auth_err:
             entry.update(status="blocked", error=auth_err)
             problems.append(f"step {seq} ({kind}): {auth_err}")
@@ -616,11 +698,27 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
             if step.get("provides") and new_id:
                 id_map[step["provides"]] = new_id
             elif step.get("provides"):
+                entry["error"] = (f"{'created but response had no id' if writes else 'lookup returned no value at ' + str(step.get('provides_from'))}"
+                                  f"; downstream steps that reference it cannot resolve")
+                if step.get("optional"):
+                    # An OPTIONAL read-back that found nothing (prism_service_check when the
+                    # clone reports no prism key): the call itself succeeded, so it is a
+                    # finding, not a failure — flag it and carry on. Only the steps that
+                    # actually reference the value are affected, and each of those blocks on
+                    # its unresolved placeholder rather than being sent with a guess.
+                    f = {"code": "optional_lookup_empty", "kind": kind, "seq": seq,
+                         "entity": step.get("entity"), "error": entry["error"],
+                         "action": "not_checked",
+                         "message": f"step {seq} ({kind}): {entry['error']}. It is optional, "
+                                    f"so the run continued; any step needing the value is "
+                                    f"blocked."}
+                    entry["flags"] = [f]
+                    run_flags.append(f)
+                    record(entry)
+                    continue
                 # A lookup that resolved nothing is a hard failure, not a warning: every
                 # downstream step referencing it would block anyway, and stopping here
                 # names the real cause instead of surfacing an unresolved placeholder.
-                entry["error"] = (f"{'created but response had no id' if writes else 'lookup returned no value at ' + str(step.get('provides_from'))}"
-                                  f"; downstream steps that reference it cannot resolve")
                 problems.append(f"step {seq} ({kind}): {entry['error']}")
                 failed += 1
                 record(entry)
@@ -669,7 +767,9 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                     entry["verify_error"] = f"unknown verifier {v.get('compare')!r}"
                     problems.append(f"step {seq} ({kind}): {entry['verify_error']}")
                 else:
-                    expected = v.get("expected") or []
+                    # expected may name the clone's own ids as placeholders (the prism
+                    # service check does) — resolve them like a body
+                    expected = substitute(v.get("expected") or [], id_map)
                     if v.get("compare") == "workflows":
                         # Only expect what this run actually created: a webhook whose own
                         # create failed is already an optional_step_failed flag, and

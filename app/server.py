@@ -15,14 +15,82 @@ THIS APPLICATION WRITES. Every path defaults to not writing, and a live run need
 dry_run=false AND confirm=="CLONE" AND a token. CAT offers no rollback, so read the
 safety notes in README.md before running anything live.
 """
-import json, pathlib, datetime, http.server, socketserver, threading
+import json, os, pathlib, datetime, http.server, socketserver, threading
 import clone_capture as cc
 import clone_apply as capp
 import clone_cleanup as ccl
 
 HERE = pathlib.Path(__file__).parent
-PORT = 8788
-CAT_BASE = "https://client-admin.cko-sbox.ckotech.co/api"
+# Overridable so the page can be served on whatever port the registered Okta login redirect
+# URI names (CLONE_PORT=<port>). The Okta redirect_uri below follows this value.
+PORT = int(os.environ.get("CLONE_PORT", "8788"))
+# Where the SOURCE is read from, by mode (the page's Sandbox → Sandbox / Prod → Sandbox
+# toggle, sent as source_env). Hosts from the CAT swagger's servers list. Writes — apply,
+# verify, cleanup — ALWAYS go to the sandbox: TARGET_CAT_BASE never varies.
+# NOTE the prod host: the swagger's servers list says client-admin-prod.ckotech.co, which
+# does not resolve (verified 2026-09-09: DNS failure -> "HTTP 0" on the first prod run).
+# The CAT configuration helper uses client-admin.cko-prod.ckotech.co, which resolves and
+# answers 401 without a token — that is the real one.
+CAT_BASES = {"sandbox": "https://client-admin.cko-sbox.ckotech.co/api",
+             "prod": "https://client-admin.cko-prod.ckotech.co/api"}
+TARGET_CAT_BASE = CAT_BASES["sandbox"]
+CAT_BASE = TARGET_CAT_BASE          # the write base; kept under its old name
+# The client-facing API the source's webhooks are read from, by mode (reads only).
+API_BASES = {"sandbox": cc.SANDBOX_API_BASE, "prod": cc.PROD_API_BASE}
+
+
+def source_env(payload):
+    """("sandbox"|"prod", None) from the page's toggle, or (None, error)."""
+    v = str(payload.get("source_env") or "sandbox").strip().lower()
+    if v not in CAT_BASES:
+        return None, f"source_env must be 'sandbox' or 'prod', not {v!r}"
+    return v, None
+
+
+def source_cat_token(payload, env):
+    """The token the SOURCE reads use: the prod token in prod mode, else the CAT token."""
+    if env == "prod":
+        return (payload.get("src_cat_token") or "").strip()
+    return (payload.get("cat_token") or "").strip()
+
+
+def prod_source_key(payload, env):
+    """The source client's PRODUCTION secret key — read-only, prod mode only.
+
+    Returns (key|None, error). Refused outright outside Prod → Sandbox, and refused if it
+    looks like a sandbox key (that would be the wrong field). It is used for exactly one
+    thing: reading the source's webhooks from api.checkout.com at capture. It is never
+    placed in the keys handed to apply_plan, so it cannot reach a write.
+    """
+    val = (payload.get("src_prod_sk") or "").strip()
+    if not val:
+        return None, None
+    if env != "prod":
+        return None, "Source production secret key is only accepted in Prod → Sandbox mode"
+    if not val.startswith("sk_") or val.startswith("sk_sbox_"):
+        return None, "Source production secret key must be a production sk_ key (not sk_sbox_)"
+    return val, None
+
+# Okta SSO for the CAT token — the same Okta apps the CAT UI and the CAT configuration
+# helper use, OAuth 2.0 implicit flow, entirely in the browser. These are PUBLIC values (an
+# OIDC public client has no secret): the server only serves them to the page and takes no
+# part in the login; the bearer arrives in the same cat_token field a pasted token uses.
+# redirect_uri must be registered on the Okta app — if it is not, Okta shows a
+# redirect_uri error on the way in and http://localhost:PORT/ has to be added by the app's
+# owners. Prod is served too, for the Prod → Sandbox mode (read-only source, TODO §00.5).
+OKTA = {
+    "sandbox": {"issuer": "https://checkout.oktapreview.com/oauth2/ausskuj3xaCB7FT2g0h7",
+                "client_id": "0oasktz00noN5cA5x0h7"},
+    "prod":    {"issuer": "https://checkout.okta.com/oauth2/aus14y376tJ9vBv7B357",
+                "client_id": "0oa4sy8n5hKfYBJK4357"},
+}
+OKTA_SCOPE = "openid profile clientadmin-tool"
+
+
+def okta_config(port=None):
+    """What the page needs to start a login. Public values only; nothing here is a secret."""
+    return {"envs": OKTA, "scope": OKTA_SCOPE,
+            "redirect_uri": f"http://localhost:{port or PORT}/"}
 # Live clone runs journal here, one .jsonl per run. Gitignored: contains
 # real created-object ids from a write run.
 RUNS_DIR = HERE.parent / "clone-runs"
@@ -60,15 +128,39 @@ def sandbox_keys(payload):
     return keys, None
 
 
+def reachability_note(reader, code):
+    """Explain an empty read honestly. HTTP 0 is not a CAT answer: the request never got
+    one (DNS, connection, TLS, timeout) — the token was never even evaluated. Say so, with
+    the host and the recorded error, instead of the misleading "check the token"."""
+    if code == 0:
+        err = next((e.get("error") for e in reader.errors if e.get("error")), "no HTTP response")
+        return (f"could not reach {reader.base} ({err}). The token was not evaluated — "
+                f"check the hostname and that you are on the VPN.")
+    if code in (401, 403):
+        return f"HTTP {code} from {reader.base} — the token was refused (expired, or for the other environment?)"
+    return f"HTTP {code} from {reader.base} (check the client id and that the token is valid/unexpired)"
+
+
 def clone_capture_handler(payload):
     """Read-only: reads the source client and returns an ordered clone plan."""
     keys, kerr = sandbox_keys(payload)
     if kerr:
         return {"error": kerr}
+    env, eerr = source_env(payload)
+    if eerr:
+        return {"error": eerr}
+    prod_key, perr = prod_source_key(payload, env)
+    if perr:
+        return {"error": perr}
     client_id = (payload.get("client_id") or "").strip()
-    token     = (payload.get("cat_token") or "").strip()
+    token     = (payload.get("cat_token") or "").strip()      # the TARGET (sandbox) token
+    src_token = source_cat_token(payload, env)                # what reads the source
     if not client_id or not token:
         return {"error": "client_id and cat_token are required"}
+    if env == "prod" and not src_token:
+        return {"error": "Prod → Sandbox needs the Source CAT token (prod) as well as the "
+                         "sandbox CAT token — the source is read with the former, the "
+                         "target's currency and scope lists with the latter"}
     # Scope: the entities ticked on the page (a list), or the older single-id field.
     raw_scope = payload.get("only_entities")
     if raw_scope is not None and not isinstance(raw_scope, list):
@@ -83,14 +175,24 @@ def clone_capture_handler(payload):
     run_id = str(payload.get("run_id") or stamp)
     progress_start(run_id, None, kind="capture")
     try:
-        cap = cc.capture(CAT_BASE, token, client_id,
+        cap = cc.capture(CAT_BASES[env], src_token, client_id,
                          only_entity=(payload.get("only_entity") or "").strip() or None,
                          only_entities=only_entities or None,
-                         # the SOURCE's secret key reads its webhooks; never the destination's
-                         sandbox_secret_key=keys.get("source_sandbox_secret"),
+                         # the SOURCE's secret key reads its webhooks; never the
+                         # destination's. In prod mode that is the production key, against
+                         # the production API — reads only.
+                         sandbox_secret_key=(prod_key if env == "prod"
+                                             else keys.get("source_sandbox_secret")),
+                         sandbox_api_base=API_BASES[env],
+                         source_env=env,
+                         # prod mode: capability reads (currencies, scopes) go to the target
+                         target_base=TARGET_CAT_BASE if env == "prod" else None,
+                         target_token=token if env == "prod" else None,
                          on_progress=lambda e: progress_step(run_id, e))
     finally:
         progress_finish(run_id)
+    # the sandbox receiver every prod webhook is pointed at (prod mode; see build_plan)
+    cap["webhook_receiver_url"] = (payload.get("webhook_receiver_url") or "").strip()
     # Persist the RAW capture, every time, before anything is derived from it. When a
     # plan skips something, the question is always "what did CAT actually return?" — and
     # until now the only answer was to ask someone to paste it. Gitignored with the
@@ -99,14 +201,28 @@ def clone_capture_handler(payload):
     try:
         cap_path = RUNS_DIR / f"capture-{stamp}-{client_id}.json"
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        cap_path.write_text(json.dumps(cap, indent=1, default=str), encoding="utf-8")
+        # A PRODUCTION capture is redacted before it touches disk: bank details, acquirer
+        # credentials, keys, contact details become "REDACTED(n)". The in-memory capture
+        # the plan is built from is not — the scrub needs the real shapes.
+        on_disk = cc.redact_for_disk(cap) if env == "prod" else cap
+        cap_path.write_text(json.dumps(on_disk, indent=1, default=str), encoding="utf-8")
     except Exception as ex:  # never let bookkeeping break a capture
         cap_path = f"not saved: {type(ex).__name__}: {ex}"
     if not cap.get("entities"):
         scope = cap.get("only_entities") or ([cap["only_entity"]] if cap.get("only_entity") else [])
+        errs = (cap.get("_meta") or {}).get("errors") or []
+        transport = next((e.get("error") for e in errs if e.get("error")), None)
+        codes = sorted({e.get("code") for e in errs if e.get("code")})
+        if transport:
+            why = (f"could not reach {CAT_BASES[env]} ({transport}). The token was not "
+                   f"evaluated — check the hostname and that you are on the VPN.")
+        elif codes and set(codes) <= {401, 403}:
+            why = f"CAT refused the token (HTTP {', '.join(map(str, codes))}) — expired, or for the other environment?"
+        else:
+            why = "check the ids and that the token is valid/unexpired."
         return {"error": f"No entities found for {client_id} "
-                         + (f"matching the selected entities {', '.join(scope)}. " if scope else "")
-                         + "(check the ids and that the token is valid/unexpired).",
+                         + (f"matching the selected entities {', '.join(scope)}. " if scope else "— ")
+                         + why,
                 "run_id": run_id, "calls": cap.get("_meta", {}).get("calls")}
     if cap.get("scope_missing"):
         # Refuse, don't guess: a plan for fewer entities than were ticked would apply
@@ -118,7 +234,7 @@ def clone_capture_handler(payload):
     plan = cc.build_plan(cap, (payload.get("new_client_name") or "").strip() or None)
     return {"plan": plan, "problems": cc.validate_plan(plan),
             "calls": cap.get("_meta", {}).get("calls"),
-            "run_id": run_id,
+            "run_id": run_id, "source_env": env,
             "capture_path": str(cap_path),
             # what cleanup could undo if this plan were applied — shown before committing
             "cleanup_outlook": ccl.cleanup_outlook(plan)}
@@ -163,11 +279,15 @@ def clone_apply_handler(payload):
     run_id = str(payload.get("run_id") or stamp)
     progress_start(run_id, len(plan["steps"]))
     try:
-        run = capp.apply_plan(plan, base=CAT_BASE, token=token, dry_run=False,
+        # Writes go to the sandbox whatever the source was (TARGET_CAT_BASE); a plan read
+        # from production gets a redacted journal — the bodies would carry prod values.
+        prod_source = (plan.get("source") or {}).get("env") == "prod"
+        run = capp.apply_plan(plan, base=TARGET_CAT_BASE, token=token, dry_run=False,
                               stop_on_error=True, pace_seconds=0.35,
                               manual_values=payload.get("manual_values") or {},
                               journal_path=str(jpath), sandbox_keys=keys,
-                              on_step=lambda e, n: progress_step(run_id, e))
+                              on_step=lambda e, n: progress_step(run_id, e),
+                              redact=cc.redact_for_disk if prod_source else None)
     finally:
         progress_finish(run_id)
     return {"run": run, "summary": capp.render_run(run), "journal_path": str(jpath),
@@ -225,14 +345,18 @@ def clone_entities_handler(payload):
     _, kerr = sandbox_keys(payload)
     if kerr:
         return {"error": kerr}
+    env, eerr = source_env(payload)
+    if eerr:
+        return {"error": eerr}
     client_id = (payload.get("client_id") or "").strip()
-    token     = (payload.get("cat_token") or "").strip()
+    token     = source_cat_token(payload, env)      # reads the SOURCE: prod token in prod mode
     if not client_id or not token:
-        return {"error": "client_id and cat_token are required"}
-    r = cc.Reader(CAT_BASE, token)
-    ents, code = r.hal(f"/clients/{client_id}/entities?limit=25&skip=0", "entities")
+        return {"error": "client_id and cat_token are required"
+                         + (" (the Source CAT token in Prod → Sandbox mode)" if env == "prod" else "")}
+    r = cc.Reader(CAT_BASES[env], token)
+    ents, code = r.hal_all(f"/clients/{client_id}/entities", "entities")
     if not ents:
-        return {"error": f"No entities found for {client_id} (HTTP {code})"}
+        return {"error": f"No entities found for {client_id} — " + reachability_note(r, code)}
     return {"entities": [{"id": e.get("id"), "name": e.get("name"),
                           "status": e.get("status"), "region": e.get("region")}
                          for e in ents]}
@@ -320,6 +444,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _page(self, name):
         """Serve a tracked HTML page, injecting local dev creds for prefill."""
         html = (HERE/name).read_text()
+        # Okta values for the sign-in button (public; see OKTA above)
+        html = html.replace("</head>", "<script>window.__OKTA__=" + json.dumps(okta_config())
+                            + ";</script></head>", 1)
         creds = dev_creds()
         if creds:
             tag = "<script>window.__DEV_CREDS__=" + json.dumps(creds) + ";</script>"

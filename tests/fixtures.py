@@ -941,6 +941,121 @@ def sessions_only_prism_capture():
     return cap
 
 
+PROD_IBAN = "GB29NWBK60161331926819"
+PROD_ACCOUNT_NUMBER = "31926819"
+PROD_MID = "prodmid-778899"
+PROD_TOKEN = "prodtok-secret-1"
+PROD_PASSWORD = "P4ssw0rd-prod"
+PROD_AUTH_KEY = "0f3c1c1e-9b7d-4a8e-8c2f-1d2e3f4a5b6c"
+PROD_SEN = "9876543210"
+PROD_CAID = "445566"
+PROD_SIRET = "11122233344455"
+PROD_WEBHOOK_URL = "https://merchant.example.com/prod/webhooks"
+PROD_WEBHOOK_AUTH = "Bearer prod-receiver-secret"
+
+
+def prod_capture(receiver_url=None):
+    """The reference client as if read from PRODUCTION: source_env "prod", and the
+    production-only values a sandbox read masks — a real bank account on the payout
+    setting, live acquirer credentials and an Amex SEN on a profile, an authorization key
+    and CAIDs on a processor, a webhook pointing at the merchant's production receiver
+    with an Authorization header and signing key. Every one of these must be scrubbed by
+    build_plan and masked by redact_for_disk."""
+    cap = webhooks_capture()
+    cap["source_env"] = "prod"
+    cap["_meta"]["source_env"] = "prod"
+    cap["network_tokens"], cap["network_tokens_source"] = None, "not_read_prod"
+    cap["webhook_receiver_url"] = receiver_url or ""
+    ent = cap["entities"][0]
+    # a payout setting with the merchant's bank account
+    ps = ent["payout_settings"][0]
+    ps["payment_instrument"]["bank_details"] = {
+        "bank_name": "NatWest", "branch_name": "Manchester", "bank_code": "601613",
+        "account_number": PROD_ACCOUNT_NUMBER, "iban": PROD_IBAN, "swift_bic": "NWBKGB2L",
+        "account_type": "Curr", "address": {"line1": "1 Bank St", "city": "Manchester",
+                                            "postcode": "M1 1AA", "country_iso3_code": "GBR"}}
+    ps["payment_instrument"]["account_holder_details"] = {
+        "company_name": "Reference Retail Ltd",
+        "address": {"line1": "1 High St", "city": "London", "postcode": "E1 6AN",
+                    "country_iso3_code": "GBR"}}
+    # a profile with live acquirer credentials, an SEN and a carried CAID
+    prof = ent["processing_profiles"][0]["detail"]
+    cs = dict(prof.get("custom_settings") or {})
+    cs["credentials"] = [{"currency": "GBP", "mid": PROD_MID, "mid_for_payment": PROD_MID,
+                          "token": PROD_TOKEN, "reporting_auth_key": "rak-1",
+                          "processing_mode": "std", "send_cardholder_ip": True,
+                          "merchant_initiated_transactions_supported": True}]
+    cs["sensitive_password"] = PROD_PASSWORD
+    cs["username"] = "prod-user"
+    cs["siret"] = PROD_SIRET          # required by a French acquirer profile's create
+    cs["project_api_key"] = "pak-" + "9" * 28
+    # GBP has a sandbox SE number (oversized tier); SLE has none and must be left out
+    cs["SE_CCY"] = [{"currency": "GBP", "processing_threshold": 100,
+                     "service_establishment_number": PROD_SEN},
+                    {"currency": "SLE", "processing_threshold": 100,
+                     "service_establishment_number": PROD_SEN}]
+    prof["currencies"] = sorted(set(prof.get("currencies") or []) | {"GBP", "SLE"})
+    prof["custom_settings"] = cs
+    prof["auto_generate_card_acceptor_identification_code"] = False
+    prof["business_settings"] = [{"merchant_category_code": "5815",
+                                  "card_acceptor_identification_code": PROD_CAID,
+                                  "force_caid_generation": False}]
+    prof["card_acceptor_email"] = "ops@merchant.example.com"
+    prof["card_acceptor_phone"] = "+442071234567"
+    prof["acquiring_bin"] = 412345
+    cap["client"]["email"] = "owner@merchant.example.com"
+    # a processor with an authorization key and CAIDs
+    pr = ent["processing_channels"][0]["processors"][0]
+    pr["authorization_key"] = PROD_AUTH_KEY
+    pr["billing_information"] = {"card_acceptor_id": PROD_CAID, "acceptor_name": "REF"}
+    pr["card_acceptor_identification_code"] = PROD_CAID
+    # the in-scope webhook points at production and carries secrets
+    for wf in cap["workflows"]:
+        for a in wf.get("actions", []):
+            if a.get("type") == "webhook":
+                a["url"] = PROD_WEBHOOK_URL
+                a["headers"] = {"Authorization": PROD_WEBHOOK_AUTH}
+                a["signature"] = {"method": "HMACSHA256", "key": "prod-signing-key"}
+    return cap
+
+
+LEGACY_PRISM_KEY = "8b325f8617da4c30927d529ff823387d"
+
+
+def legacy_prism_key_capture():
+    """The reference client with one channel whose prism service key is a legacy opaque
+    32-hex id instead of the client|entity composite — what the production client
+    cli_4ucq… carried on one of fourteen channels (2026-09-09, step 43). Such a key names
+    nothing the remapper can rewrite and is unknown to the clone's prism service."""
+    cap = reference_capture()
+    svcs = cap["entities"][0]["processing_channels"][0]["detail"]["services"]
+    for s in svcs:
+        if s.get("type") == "prism":
+            s["key"] = LEGACY_PRISM_KEY
+    return cap
+
+
+def _aws_workflow(tag, name, entity_ids=(), regions=("eu-west-1", "eu-west-2")):
+    """A workflow whose actions are Amazon EventBridge deliveries (type "aws": account_id +
+    region), as the production client's "EventBridge Notifications" workflow was — the
+    first non-webhook action type the tool met (prod run 2026-09-09T15:17Z)."""
+    w = _workflow(tag, name, entity_ids=entity_ids)
+    ts = {"created_at": "2025-07-07T12:22:00.523+00:00", "updated_at": "2025-07-07T12:22:00.523+00:00"}
+    w["actions"] = [{"id": _id("wfa", f"{tag}{i}"), "type": "aws",
+                     "account_id": "123456789012", "region": r,
+                     "_links": {"self": {"href": f"https://api.sandbox.checkout.com/workflows/{w['id']}/actions/{_id('wfa', f'{tag}{i}')}"}},
+                     **ts} for i, r in enumerate(regions)]
+    return w
+
+
+def aws_workflow_capture():
+    """webhooks_capture plus an in-scope workflow with two aws actions."""
+    cap = webhooks_capture()
+    eid = cap["entities"][0]["id"]
+    cap["workflows"].append(_aws_workflow("aws", "EventBridge Notifications", entity_ids=[eid]))
+    return cap
+
+
 def dropped_currency_account_capture():
     """A currency account in a currency CKO will not enable.
 

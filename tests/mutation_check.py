@@ -301,7 +301,7 @@ MUTATIONS = [
 
     # -- capture persistence + unreadable default entity -------------------------
     ("raw capture not persisted to clone-runs", "app/server.py",
-     '        cap_path.write_text(json.dumps(cap, indent=1, default=str), encoding="utf-8")',
+     '        cap_path.write_text(json.dumps(on_disk, indent=1, default=str), encoding="utf-8")',
      '        pass'),
     ("missing default_entity_id value misreported as out-of-scope", "app/clone_capture.py",
      '        elif default_eid is None:',
@@ -579,6 +579,75 @@ MUTATIONS = [
     ("API key steps emitted without the scope catalogue", "app/clone_capture.py",
      '        scopes = cap.get("api_key_scopes")\n        if not scopes:',
      '        scopes = cap.get("api_key_scopes") or {"secret": [], "public": []}\n        if False:'),
+
+    # -- workflow actions: per-type allowlist, unknown types never sent hollow --------------
+    ("aws action sent without account_id/region", "app/clone_capture.py",
+     '                          "aws": {"type", "account_id", "region"}}',
+     '                          "aws": {"type"}}'),
+    ("unknown action type sent as a hollow {type} instead of skipping", "app/clone_capture.py",
+     '        if fields is None:\n            unsupported.append((a or {}).get("type"))\n            continue',
+     '        if fields is None:\n            fields = {"type"}'),
+
+    # -- legacy prism key: never sent to the clone unchanged --------------------------------
+    ("legacy prism service key passed through to the clone", "app/clone_capture.py",
+     '                    tok = prism_key_token(eid)\n'
+     '                    svc["key"] = ph(tok)\n'
+     '                    creq.append(tok)',
+     '                    tok = prism_key_token(eid)\n'
+     '                    creq.append(tok)'),
+    ("clone prism key not read back before the channels", "app/clone_capture.py",
+     '                provides=prism_key_token(eid), provides_from="prism.prism_key",',
+     '                provides=prism_key_token(eid), provides_from="prism.is_enabled",'),
+
+    # -- Prod -> Sandbox: reads from prod, writes to sandbox, nothing prod-only leaks -----
+    ("apply writes to the SOURCE environment's CAT", "app/server.py",
+     '        run = capp.apply_plan(plan, base=TARGET_CAT_BASE, token=token, dry_run=False,',
+     '        run = capp.apply_plan(plan, base=CAT_BASES["prod"], token=token, dry_run=False,'),
+    ("production secret key accepted outside prod mode", "app/server.py",
+     '    if env != "prod":\n'
+     '        return None, "Source production secret key is only accepted in Prod → Sandbox mode"',
+     '    if False:\n'
+     '        return None, "Source production secret key is only accepted in Prod → Sandbox mode"'),
+    ("prod bank details carried into the payout setting", "app/clone_capture.py",
+     '                removed = [k for k in ("bank_details", "account_holder_details")\n'
+     '                           if pi.pop(k, None) is not None]',
+     '                removed = []'),
+    ("prod Amex SE number carried instead of sandbox's own", "app/clone_capture.py",
+     '                        kept.append(dict(rw, service_establishment_number=sen))',
+     '                        kept.append(dict(rw))'),
+    ("a currency with no sandbox SE number kept on the Amex profile", "app/clone_capture.py",
+     '                    body["currencies"] = [c for c in (body.get("currencies") or [])\n'
+     '                                          if c not in no_sen]',
+     '                    pass'),
+    ("required SIRET stripped instead of replaced by the placeholder", "app/clone_capture.py",
+     '                cs["siret"] = SANDBOX_SIRET_PLACEHOLDER',
+     '                cs.pop("siret", None)'),
+    ("prod acquirer credentials kept in custom_settings", "app/clone_capture.py",
+     '            stripped = [f for f in PROD_PROFILE_STRIP if f in cs]',
+     '            stripped = []'),
+    ("prod card acceptor id carried", "app/clone_capture.py",
+     '                elif prod:\n'
+     '                    # A production CAID is meaningless in sandbox, which assigns its own:',
+     '                elif False:\n'
+     '                    # A production CAID is meaningless in sandbox, which assigns its own:'),
+    ("prod capture written to disk unredacted", "app/server.py",
+     '        on_disk = cc.redact_for_disk(cap) if env == "prod" else cap',
+     '        on_disk = cap'),
+    ("journal redaction dropped for a prod source", "app/server.py",
+     '                              redact=cc.redact_for_disk if prod_source else None)',
+     '                              redact=None)'),
+    ("pagination stops after the first page", "app/clone_capture.py",
+     '            if not page or len(page) < limit or (total is not None and skip >= total):\n'
+     '                break',
+     '            break'),
+    ("a step's required manual values not enforced", "app/clone_apply.py",
+     '        elif missing_manual:',
+     '        elif False:'),
+
+    # -- Okta SSO: the two environments' Okta apps must never be mixed up --------------
+    ("sandbox sign-in pointed at the prod Okta authorization server", "app/server.py",
+     '    "sandbox": {"issuer": "https://checkout.oktapreview.com/oauth2/ausskuj3xaCB7FT2g0h7",',
+     '    "sandbox": {"issuer": "https://checkout.okta.com/oauth2/aus14y376tJ9vBv7B357",'),
 
     # -- capture progress: every read reported, stamped, and stored under the run_id ------
     ("capture progress hook never fires", "app/clone_capture.py",

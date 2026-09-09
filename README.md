@@ -24,15 +24,16 @@ python3 app/server.py     # http://localhost:8788
 | Field | Notes |
 |---|---|
 | Client ID | prefills from `app/dev-creds.json` — this is the **source** client |
-| **CAT API bearer token** | **paste this** — short-lived Okta token, expires in ~1h |
+| **CAT API bearer token** | **Sign in with Okta** (button under the field) or paste — short-lived Okta token, expires in ~1h; the line under the field shows who is signed in, which environment, and the countdown |
 | Source Sandbox Secret Key | the **source** client's `sk_sbox_…` — prefills from the gitignored `app/dev-creds.local.json` if present, else typed. Read-only: capture uses it to read the source's webhooks (Workflows) from the Checkout sandbox API |
 | Destination Sandbox Secret Key | **optional.** The run mints the new client's API keys itself (see *Step order*) and uses the secret one for the webhooks. Paste a key here only if the new client already has one you want used instead |
 | Sandbox Public Key | `pk_sbox_…` — reserved for endpoints that take a public key; nothing uses it yet |
 
 Top right, a **Sandbox → Sandbox / Prod → Sandbox** toggle says where the *source* is read
-from (the clone is always created in sandbox). It defaults to Sandbox → Sandbox. Nothing
-branches on it yet; the page keeps it in `MODE` for the conditional logic to come — the first
-consumer should be the Prod → Sandbox payout-details callout (TODO §00.5).
+from; the clone is always created in sandbox. It defaults to Sandbox → Sandbox. In
+**Prod → Sandbox** the panel gains a *Source CAT token (prod)* with its own Okta button, a
+*Source production secret key* (webhooks) and a *Webhook receiver URL for the clone*, and a
+red banner lists what is not carried from production — see *Prod → Sandbox* below.
 
 The three stage cards across the top are buttons, each its own page. The same numbered
 warnings open every page so they are never out of sight — each warning carries a short label
@@ -60,7 +61,9 @@ much smaller blast radius — and that matters, because most of what a clone cre
 deleted afterwards. A ticked entity that CAT does not return refuses the capture outright
 rather than quietly planning a smaller clone.
 
-Cloning one entity of the reference client produces **33 steps** and runs in under a minute.
+Cloning one entity of the reference client produces **37 CAT steps** (plus one step per
+source webhook and a read-back) and runs in under a minute; the three-entity reference
+client is **95 steps**.
 
 ### Requirements
 
@@ -69,8 +72,8 @@ Python **3.9+** and nothing else — pure standard library. No dependencies to i
 ### Tests
 
 ```bash
-python3 tests/test_plan.py        # 227 tests, well under a second
-python3 tests/mutation_check.py   # 107 mutants — proves those tests have teeth
+python3 tests/test_plan.py        # 284 tests, well under a second
+python3 tests/mutation_check.py   # 136 mutants — proves those tests have teeth
 ```
 
 No token, no network, no writes. The suite asserts on the plan document and on a dry run:
@@ -104,7 +107,9 @@ proves every `requires` is satisfied by an *earlier* step and that no source id 
 twice.
 
 Two optional step fields exist for ids CAT mints on the target that no create call returns:
-`provides_from` (dotted path into the response) and `retry` (`{attempts, delay_seconds}`).
+`provides_from` (dotted path into the response) and `retry` (`{attempts, delay_seconds}`,
+plus an optional `when_error_contains` that limits retries to a matching error text — so a
+step waiting out a known race does not burn its budget on an unrelated rejection).
 Two more govern how a step behaves: `verify` (a read compared with the source at apply
 time — differences become run-time flags) and **`optional`** — an enhancement nothing
 downstream depends on, whose live failure is recorded as an `optional_step_failed` flag
@@ -115,12 +120,12 @@ completed every step is still auditable for what the plan chose not to attempt.
 
 ### Step order
 
-23 step kinds, in dependency order:
+24 step kinds, in dependency order:
 
 ```
 client → client_risk_settings → client_flow_account → client_compass_settings →
 client_compass_check → vault_lookup → entity → currency_account → processing_profile →
-entity_service → processing_channel → processor → sessions_channel →
+entity_service → prism_service_check → processing_channel → processor → sessions_channel →
 sessions_profile_processor → payment_routing_rule → payout_routing_rule →
 payout_setting → payout_route_check → client_public_crypto_key →
 client_api_secret_key → client_api_public_key → webhook_workflow → webhook_check
@@ -159,13 +164,21 @@ entity and processing-channel conditions are remapped through the id map, and an
 outside the capture's scope is dropped — a condition left empty means the workflow is
 **skipped and flagged** (`webhook_scope_emptied`), never created with a widened match. The
 event condition is validated against `GET /workflows/event-types` (read at capture with the
-source key): a retired event — `gateway.payment_authorized` on the first live run, which
-made the whole create fail with `condition_event_types_invalid` — is left out and flagged
-(`webhook_event_dropped`, "will still be created, but …"); if the catalogue cannot be read
-nothing is filtered and `webhook_events_not_checked` says so. The receiver URL, its
+source key): a retired event — `gateway.payment_authorized` on the run of 2026-09-08T16:03Z,
+which made that one create fail with `condition_event_types_invalid` — is left out and
+flagged (`webhook_event_dropped`, "will still be created, but …"); with the gate in place the
+next run created 4 of 4 (2026-09-09). If the catalogue cannot be read nothing is filtered and
+`webhook_events_not_checked` says so. The receiver URL, its
 headers and the signing key are carried as-is
 (they *are* the configuration for a sandbox → sandbox clone); the URL is flagged
-(`webhook_url_carried`) so the operator confirms the receiver. Apply sends these with the
+(`webhook_url_carried`) so the operator confirms the receiver. Actions are allowlisted **per
+type** (`WORKFLOW_ACTION_FIELDS`): `webhook` (url, headers, signature) and `aws` — Amazon
+EventBridge, `account_id` + `region`; sent as a bare `{"type": "aws"}` it failed with
+`region_required` on the production client's "EventBridge Notifications" workflow. A type the
+table does not know makes the whole workflow a manual step (`webhook_action_unsupported`)
+rather than a create missing an action; in Prod → Sandbox an `aws` action targets the
+merchant's production AWS, so that workflow is a manual step too (`webhook_aws_manual`, with
+the regions). Apply sends these with the
 *Destination* Sandbox Secret Key against `api.sandbox.checkout.com`. Both steps are
 `optional`: without the destination key they are **blocked with an `optional_step_blocked`
 flag and the run continues**, so a CAT clone never fails because the new client's keys
@@ -225,7 +238,60 @@ not carried** — see TODO §00.1.
 `entity_service` is the one PUT a plan emits: a channel's `services[]` *references*
 something enabled on the entity rather than enabling it, so a source channel carrying a
 `prism` (fraud detection) service needs `PUT /entities/{id}/services/prism` first or the
-channel create fails with `invalid_prism_merchant_service`.
+channel create fails with `invalid_prism_merchant_service`. It is followed by
+`prism_service_check`, a GET of `/entities/{id}/services` that asserts the service is enabled
+and captures the `prism_key` CAT minted for the clone — the value a channel uses when its
+source prism key is not the remappable `client|entity` composite (see the traps table).
+
+---
+
+## Prod → Sandbox
+
+The source is read from **production CAT** (`client-admin.cko-prod.ckotech.co` — the host the CAT configuration helper uses; the
+swagger's `client-admin-prod.ckotech.co` does not resolve, which is what the first prod run's
+"HTTP 0" meant) with a **prod CAT token**; everything is still created in
+**sandbox** with the sandbox token — `server.CAT_BASES[source_env]` picks the read host,
+`TARGET_CAT_BASE` never varies, and a test pins that apply, verify and cleanup ignore the
+prod token entirely. The page sends `source_env` with every request (built 2026-09-09).
+
+Two things about the reads differ from sandbox → sandbox. **Capability reads go to the
+target:** which currencies CAT accepts and which API-key scopes exist are read from the
+sandbox CAT (a second `Reader`), because that is where the creates land; a prod-only
+currency or acquirer is therefore dropped or refused against sandbox's rules, not prod's.
+The per-acquirer currency read doubles as an **acquirer existence check**: a definitive
+400/404 from the target means its profiles — and their processors — are skipped with
+`acquirer_not_in_sandbox` rather than emitted to fail mid-run. **The NT portal is not
+read** (its production host is unknown); network tokens stay the manual step they already
+are. The source's webhooks are read from `api.checkout.com` with the *Source production
+secret key*, accepted only in this mode and only for that read — it is never placed in the
+keys handed to apply.
+
+**What never leaves production**, by `PROD_*` tables in `clone_capture.py`, each raising a
+flag in the numbered list so the handover says what was left out:
+
+| Data | Treatment |
+|---|---|
+| `payment_instrument.bank_details` / `account_holder_details` | not carried; the payout-setting step declares `needs_manual` and is **blocked** until a sandbox test account is supplied as manual values `<seq>.payment_instrument.bank_details` (nested paths now resolve) |
+| profile `custom_settings` credentials (`credentials[]`, `sensitive_password`, `username`, `project_api_key`, `merchant_id`, contract ids…) and `SE_CCY[].service_establishment_number` | stripped (`prod_credentials_stripped`); sandbox acquirers use their own |
+| profile `custom_settings.siret` | replaced by the placeholder `12345678912345` (`prod_siret_placeholder`, action *substituted*) — a Cartes Bancaires profile's create **requires** one (`siret_required`, learned on the first prod run); the placeholder passes validation and is not a real registration |
+| profile `custom_settings.SE_CCY[].service_establishment_number` (Amex) | replaced by **sandbox's own SE number for that currency** from the "oversized" tier (`AMEX_SANDBOX_SEN`, the CAT form's `merchant_size` option list — not in the swagger, pinned in code), with `custom_settings.merchant_size` set to `oversized` as the known-good sandbox Amex create does (`prod_sen_sandbox_oversized`). A currency sandbox has no SE number for is left out of the rows **and** the profile's currencies (`prod_sen_currency_unavailable`). An SE_CCY row without a number is refused (`custom_settings_se_ccy_0_invalid`, second prod run) |
+| card acceptor ids — profile CAID (even with auto-generate off), processor `billing_information.card_acceptor_id` and CAID | blanked, auto-generate forced on (`prod_caid_regenerated`, `prod_processor_fields_dropped`) |
+| processor `authorization_key` | dropped (sandbox mode keeps carrying it — known to work there) |
+| webhook `url`, `headers`, `signature` | url replaced by the *Webhook receiver URL for the clone*, headers and signing key dropped (`webhook_receiver_substituted`); no URL given → the workflow is a manual step (`webhook_prod_manual`) |
+| acquiring BINs | carried, flagged once (`prod_bin_carried`) — validation is the next build |
+| contact details (client email, card-acceptor email/phone) | carried, flagged once (`prod_contact_details_carried`) — decision 2026-09-09 |
+
+**Redaction on write.** A prod capture is saved to `clone-runs/` through
+`redact_for_disk` (bank fields, credentials, keys, CAIDs, contact details and receiver URLs
+become `REDACTED(n)`; shapes are kept), and a plan whose `source.env` is `prod` gets a
+journal written the same way — the in-memory capture and run document are untouched, since
+the scrub needs the real shapes and the page needs the real result. **Pagination** (both
+modes): every CAT list is now read to `total_count` (`Reader.hal_all`); a list that could
+not be completed is flagged `list_truncated` instead of trusted — 25 items was a silent
+ceiling before, and a production client is where it would have bitten.
+
+Not yet done for prod (TODO §00.5): BIN validation, a prod NT-portal host, and the first
+live prod capture itself — do that read-only (capture + dry run) before any apply.
 
 ---
 
@@ -383,6 +449,7 @@ The first five are the original set; the rest were found in the multi-entity run
 | **Currencies are dynamic.** A 2023 profile carried `SLL`, `ZWL`, `LBP`; CAT no longer accepts them. See *Currencies* above — validity gate plus a small successor/policy table. | `currency_invalid` — accurate, for once |
 | **`checkout_legal_entity_codes` is required on create and unreadable on older profiles.** The 2023 Amex profile's GET has no such key; newer profiles return it. Derived from sibling profiles on the same entity (it tracks the entity, not the scheme — amex and visa on one entity both `cko-ltd-uk`); refuses if siblings disagree. | `checkout_legal_entity_code_required` |
 | **Service keys can be composites.** The `prism` (FraudDetection) service key is `<client_id>\|<entity_id>` — both source ids. Remapping only the vault key sent it verbatim. Every service key is now remapped token by token, and prism is **enabled on the entity first** (`PUT /entities/{id}/services/prism`) because a channel service *references* an enabled service, it doesn't enable it. | `invalid_prism_merchant_service` |
+| **A prism service key is not always the client\|entity composite.** One of the production client's fourteen channels carried a legacy opaque id (32 hex chars). Nothing in it is a source id, so the remapper passed it through and the "unmappable key" check — which looks for id-shaped tokens — stayed silent; the clone's prism service does not know that key. Now: after `entity_service` enables prism, `prism_service_check` reads `GET /entities/{id}/services` back, asserts `prism.is_enabled`, and captures `prism.prism_key` (the composite CAT minted for the clone) into the id map; any channel whose source key is not the composite references that captured key (`prism_key_normalised`, naming channel, original key and replacement). No key returned → the channel blocks on its placeholder, never sent with a guess. | `invalid_prism_merchant_service` — again, and again silent on the cause |
 | **A manual (profile-less) processor cannot be created by API.** The single create route returns 503 for one. Flagged and skipped, with its sessions link. | `gateway_manual_processor_creation_not_supported` (503) |
 | **The payout-routes list shares no field names with its create.** The list is a UI-option shape (`country_value`, `currency_label`, `schemes_label`); reading it with the create's names sent nulls. Routes turned out to be provisioned capability — now parity-checked, never created. | `currency_code_required` + `country_code_required` |
 | **Risk settings PUT wants part of the UI echo back**, and a valid body returned **404** 0.35s after client create. Body is now `id` (clone placeholder), `name` (clone's), `tier`, `read_only_restriction_enabled`; the PUT retries. Confirmed a race: 7/7 live runs succeeded on attempt 3–4, no POST needed. | `client_name_required`, then `404` |
@@ -403,11 +470,14 @@ re-stamped on the bodies that need it.
 
 ## Status
 
-**A full three-entity clone of the reference client runs end to end** — 86 steps, 0 failed —
-and a one-entity scope produces 33 steps. Confirmed live along the way: cross-entity step
-ordering, the catch-all-first routing constraint on a real multi-rule entity, the payout
-routing rule body (byte-identical to a known-good POST), prism enablement, Flow, and the
-risk-settings and Compass writes. Risk settings on a fresh client are provisioned
+**A full three-entity clone of the reference client runs end to end — 94 steps, 0 failed**
+(2026-09-09T09:32Z; 95 today, with the prism read-back added since), including the minted
+API keys and all four webhooks, read back and confirmed; a one-entity scope produces 37 CAT
+steps. Confirmed live along the way:
+cross-entity step ordering, the catch-all-first routing constraint on a real multi-rule
+entity, the payout routing rule body (byte-identical to a known-good POST), prism
+enablement, Flow, the risk-settings and Compass writes, API-key minting (PKCS#1 v1.5) and
+webhook creation behind the event-type gate. Risk settings on a fresh client are provisioned
 **asynchronously**: across seven live runs the PUT succeeded on attempt 3 or 4 (7–12s after
 client create) and never needed a POST. The network-tokens portal POST was also run live and
 rejected the body with `identification_value_required`, which is what settled the decision
@@ -431,17 +501,19 @@ Not yet verified:
 Known gaps — configuration the source has that the clone does **not** get today (TODO §00,
 in priority order): risk-settings **reserve rules**, **FX** configuration, **pricing
 profiles** (excluded by policy so far), **arrears** configuration, the **Prod → Sandbox
-payout-schedule account details** callout, **reporting profiles**, and **webhooks**. Until
-each is built or ruled out it should become a one-line manual-step flag like the three above.
+payout-schedule account details** callout, and **reporting profiles**. Until each is built
+or ruled out it should become a one-line manual-step flag like the three above. Webhooks
+are cloned for sandbox → sandbox; only the Prod → Sandbox variant remains open (§00.5).
 
-**The new client's API keys are minted in the run — verified live** (2026-09-08): the
-public-key create accepts `{name, type, key}`, CAT encrypts secrets with **PKCS#1 v1.5**, and
-the minted secret authenticated against the sandbox API in the same run. **Webhooks land**
-(run 2026-09-08T16:03Z: 3 of 4 created and read back; the 4th named a retired event type,
-now filtered). What it took: an allowlisted body, a secret key with only the workflow
-scopes and **no entity assignment** (an entity-assigned key cannot name other entities in a
-condition; a key with every scope needs an entity), and the event-type gate. Prod → Sandbox
-webhooks remain open (§00.5).
+**The new client's API keys are minted in the run and webhooks are cloned — both verified
+live.** The public-key create accepts `{name, type, key}`, CAT encrypts secrets with
+**PKCS#1 v1.5**, and the minted secret authenticates against the sandbox API in the same
+run. Webhooks took four live runs on 2026-09-08 to land, and the lessons are the durable
+part: an allowlisted body (the read echoes `created_at`/`updated_at` the create rejects), a
+secret key with **only the workflow scopes and no entity assignment** (an entity-assigned
+key cannot name other entities in a condition; a key with every secret scope needs an
+entity), and the event-type gate (a source workflow can name a retired event). The first
+clean run followed on 2026-09-09: 4 of 4 created and read back.
 
 ---
 
@@ -452,7 +524,7 @@ TODO.md                # open work and API quirks — read first
 app/
   server.py            # stdlib threaded HTTP server, port 8788 (+ /api/clone/progress)
   clone.html           # front end: three stage pages (Capture / Plan / Apply), no build step
-  clone_capture.py     # read source -> ordered plan  (GET only)
+  clone_capture.py     # read source -> ordered plan  (GET only; Reader on_call hook feeds the capture progress bar)
   clone_apply.py       # execute a plan (dry-run by default; on_step progress hook)
   clone_cleanup.py     # reverse a run, as far as CAT allows
   clone_keys.py        # stdlib RSA: keygen, PKCS#1 PEM, decrypt (padding detected) — mints the clone's API keys
@@ -509,6 +581,39 @@ so a production key never gets past the handler. Inside `clone_apply`, a step op
 `api.sandbox.checkout.com`; the source key is never promoted to fill a missing destination
 key — the step is **blocked**, and a dry run shows that block. The journal header records
 *which* keys were supplied, never their values.
+
+### Signing in to CAT with Okta
+
+The **Sign in with Okta** button under the token field runs the same login the CAT UI and
+the CAT configuration helper use: OAuth 2.0 **implicit flow** against Checkout's Okta,
+entirely in the browser. `server.OKTA` holds the public values (sandbox issuer
+`checkout.oktapreview.com/oauth2/ausskuj3xaCB7FT2g0h7`, client `0oasktz00noN5cA5x0h7`; prod
+issuer `checkout.okta.com/oauth2/aus14y376tJ9vBv7B357`, client `0oa4sy8n5hKfYBJK4357`; scope
+`openid profile clientadmin-tool`) and serves them to the page as `window.__OKTA__`; the
+server never talks to Okta and never sees anything but the resulting bearer, which lands in
+the same `cat_token` field a pasted token uses. An OIDC public client has no secret, so
+there is nothing to protect on the server side.
+
+The page generates `state` and `nonce`, keeps them in `sessionStorage` across the redirect,
+and on return **requires the `state` to match this tab** and the token's `nonce` to match
+before accepting it; it then strips the fragment with `history.replaceState` so the token is
+never left in the address bar or history. The line under the field decodes the token's own
+claims (display only — CAT verifies the signature) to show who is signed in, which
+environment the token is for (`cid` → sandbox or prod Okta app), and a countdown to `exp`,
+turning amber at five minutes and red when expired. A token whose environment does not match
+the Sandbox → Sandbox / Prod → Sandbox toggle is called out. The toggle also picks which
+Okta app the button uses — the prod token is for the Prod → Sandbox source read (TODO §00.5).
+
+**The redirect URI is `http://localhost:8788/`** (derived from `PORT`) and Okta only redirects
+to URIs registered on the app. **Confirmed 2026-09-09:** the first sign-in stopped at Okta
+with *"The 'redirect_uri' parameter must be a Login redirect URI in the client app
+settings"* — so `http://localhost:8788/` is not yet registered on app `0oasktz00noN5cA5x0h7`.
+The only way through is to have the app's owners add `http://localhost:8788/` (scheme, port
+and trailing slash exactly) under *General → Login redirect URIs* on that app in Okta admin
+(`checkout-admin.oktapreview.com`, the page the error links to), and later the same on the
+prod app `0oa4sy8n5hKfYBJK4357`. Pasting a token keeps working meanwhile. If the registered
+URI ever uses a different port, `CLONE_PORT=<port> python3 app/server.py` serves the page
+there and the redirect URI follows.
 
 `clone-runs/` is gitignored: journals contain real created-object ids from write runs, and
 saved captures contain a real client's full configuration — addresses, emails, bank details.

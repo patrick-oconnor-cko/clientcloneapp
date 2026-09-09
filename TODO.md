@@ -8,8 +8,49 @@
   finished. That step has since been removed (see below); a plan built from the same
   capture now yields **86 steps, none optional**. 3-entity reference client
   `cli_scna7ew7mxdenl3h36zlmkyh6m`.
-- **Tests:** `python3 tests/test_plan.py` → 267 pass. `python3 tests/mutation_check.py` →
-  126/126 mutants caught.
+- **Tests:** `python3 tests/test_plan.py` → 296 pass. `python3 tests/mutation_check.py` →
+  143/143 mutants caught.
+- **Prod → Sandbox built (2026-09-09); first live capture attempted.** Reads from
+  `client-admin.cko-prod.ckotech.co` (the swagger's `client-admin-prod.ckotech.co` does not
+  resolve — the first attempt's "HTTP 0" was a DNS failure, not a token problem) with a
+  prod CAT token, writes to sandbox; capability reads (currencies, scopes) from the
+  target; prod scrub table (`PROD_*` in clone_capture) with a flag per action; bank details
+  → `needs_manual` block; webhooks re-pointed at a typed receiver or made a manual step;
+  captures and journals redacted on disk; every list paginated to `total_count`. **First
+  live prod apply (2026-09-09T12:47Z)** got to step 26 and learned that a Cartes Bancaires
+  profile's create **requires a SIRET** (`siret_required`) — stripping it was wrong; it is
+  now replaced by the placeholder `12345678912345` and flagged `prod_siret_placeholder`
+  (Patrick's decision). **Second prod apply (13:03Z)** reached step 27 and learned the same
+  for Amex: an SE_CCY row without its service establishment number is refused
+  (`custom_settings_se_ccy_0_invalid`). Not a placeholder case: sandbox has its OWN Amex
+  SE numbers, one per currency, picked by `custom_settings.merchant_size` — clones use the
+  "oversized" tier (`AMEX_SANDBOX_SEN`, 32 currencies from the CAT form's option list, pinned
+  in code because no readable endpoint for it is known — **find one**; a currency not in the
+  table is left out of the profile, flagged). Expect more of these: every prod-only field the scrub
+  removes is a candidate for "required on create" — when one fails, the answer is a flagged
+  placeholder or a manual value, never the production value. **Third prod apply (13:40Z)**
+  reached step 43: one of fourteen channels carries a **legacy opaque prism key** (32 hex),
+  passed through unchanged → `invalid_prism_merchant_service`. Now `prism_service_check`
+  (GET `/entities/{id}/services`, after the prism PUT) asserts the service and captures
+  `prism.prism_key` into the id map; a non-composite source key references it
+  (`prism_key_normalised`). Applies in both modes. Tests: `TestLegacyPrismKey`. **Fourth
+  prod apply (15:17Z): 115/116**, the one failure a workflow with two `aws` (EventBridge)
+  actions sent hollow → `region_required`. Actions are now allowlisted per type (`aws` =
+  account_id + region, carried in sandbox mode; a manual step in prod mode since it targets
+  the merchant's production AWS); an unknown type makes the workflow a manual step. Tests:
+  `TestAwsActions`. Patrick: these are edge cases — do not over-invest.
+- **Okta SSO for the CAT token (2026-09-09), not yet tried live.** "Sign in with Okta" runs
+  the implicit flow against the sandbox or prod Okta app per the MODE toggle; the page checks
+  state/nonce, strips the fragment, shows who/env/expiry. **First live click (2026-09-09):
+  Okta refused — "The 'redirect_uri' parameter must be a Login redirect URI in the client
+  app settings"** — so `http://localhost:8788/` is not registered on app
+  `0oasktz00noN5cA5x0h7`. **Action (outside this repo):** ask the CAT/Okta owners to add it
+  (exact string, trailing slash) — the error links straight to the admin page — and later
+  the same on the prod app `0oa4sy8n5hKfYBJK4357`. Tried 2026-09-09 with another local port
+  as well — also refused, so no localhost URI is registered today; registration is the only
+  path. Pasting still works meanwhile. (`CLONE_PORT=<port>` moves the page and the redirect
+  URI together if the registered URI ever names a different port.) The prod token is only
+  useful once §00.5 gives Prod → Sandbox a prod CAT host.
 - **Capture progress bar (2026-09-08):** `Reader.on_call` → `capture(on_progress=…)` stamps
   every read `{seq, kind, sub, entity_index, entity_total, path, status}`; the server keeps
   it under the page's `cap-…` run_id (`progress_start(kind="capture", total=None)`); the page
@@ -98,12 +139,16 @@ None of them is flagged yet except pricing profiles (in `skipped[]`).
    known-good create body; if not, promote the skip to a top-of-page manual-step flag.
    Note VAS pricing is also the network-tokens prerequisite.
 4. **Arrears configuration missing.** Not captured. Same treatment as FX: find, read, decide.
-5. **Prod → Sandbox: payout-schedule account details will not transfer — needs a callout,
-   then a fix.** `payout_setting` carries `payment_instrument` (bank details) and
-   `payout_schedule` from the source; when the source is production and the target is
-   sandbox those details cannot be carried across. When `MODE === "prod"` the plan must
-   (a) flag it at the top of the page and (b) decide what to send in their place. Nothing
-   branches on `MODE` yet — this is the first thing that should.
+5. **Prod → Sandbox — BUILT 2026-09-09 (build 1), not yet run live.** See README
+   *Prod → Sandbox*. Reads go to prod CAT with a prod token, writes to sandbox; the payout
+   setting's bank details are not carried and the step is **blocked** until a sandbox test
+   account is supplied as manual values (`<seq>.payment_instrument.bank_details`); acquirer
+   credentials, CAIDs, authorization keys, SENs stripped; webhooks re-pointed at the typed
+   receiver or made a manual step; prod captures/journals redacted; lists paginated.
+   **Build 2 (open):** BIN validation against sandbox (today `prod_bin_carried` only); the
+   prod NT-portal host (today "not read"); a manual-values UI on the Apply page (today the
+   values go in the apply payload — the page has no form for them yet); the first live
+   prod capture (read-only) and what it teaches.
 6. **Reporting profiles not working.** Out of scope per CLAUDE.md ("this application does
    not read the reporting-profile … services"), so a cloned client has none. Establish
    what "not working" means on the clone (missing entirely vs created but broken), then

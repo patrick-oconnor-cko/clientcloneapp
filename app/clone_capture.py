@@ -201,6 +201,86 @@ NT_PORTAL_BASE = "https://nt-portal.sbox.checkout.internal/vault-nt-portal/cat/c
 # API, read with the SOURCE client's secret key and created with the DESTINATION's. The
 # same constant lives in clone_apply (the modules are deliberately self-contained).
 SANDBOX_API_BASE = "https://api.sandbox.checkout.com"
+# Prod -> Sandbox: the source's webhooks are read from the production API (read-only, with
+# a production secret key the server accepts only in that mode). Creates never go here.
+PROD_API_BASE = "https://api.checkout.com"
+
+# ---------------------------------------------------------------- Prod -> Sandbox scrub
+#
+# When the SOURCE is production, some of what a capture returns must never reach sandbox
+# or disk: production acquirer credentials, the merchant's real bank account, environment-
+# bound identifiers. build_plan strips or blanks these when cap["source_env"] == "prod" and
+# raises a flag for each, so the handover says what was left out; redact_for_disk masks the
+# same values in the saved capture and the run journal. Sandbox -> sandbox is untouched:
+# there CAT masks credentials itself and carrying the rest is known to work.
+#
+# Profile custom_settings keys that are acquirer credentials or contract identifiers.
+PROD_PROFILE_STRIP = ("credentials", "sensitive_password", "username", "project_api_key",
+                      "reporting_auth_key", "merchant_id", "ideal_merchant_id",
+                      "contract_number", "customer_number", "card_acceptor_tax_id")
+# A French acquirer profile (Cartes Bancaires) REQUIRES a SIRET: stripping the production
+# one failed the create with siret_required (prod run 2026-09-09T12:47Z). The clone is
+# sandbox, so a well-formed placeholder is sent instead and flagged as exactly that
+# (Patrick's decision). 14 digits, as a SIRET is.
+SANDBOX_SIRET_PLACEHOLDER = "12345678912345"
+# An Amex profile's SE_CCY rows REQUIRE a service establishment number per currency:
+# stripping the production ones failed the create with custom_settings_se_ccy_0_invalid
+# (prod run 2026-09-09T13:03Z). They are not placeholders — sandbox has its OWN SE numbers,
+# one per currency, chosen by custom_settings.merchant_size; sandbox clones use the
+# "oversized" tier (Patrick, 2026-09-09, with a known-good v2 create on the reference
+# client). The table below is the CAT form's option list for merchant_size=oversized
+# ("GBP - 7492256953 - Oversized", …). It is not in the swagger and no read of it is known,
+# so it is pinned here; a currency it does not cover cannot be processed on Amex in sandbox
+# and is left out of the profile with a flag.
+AMEX_SANDBOX_MERCHANT_SIZE = "oversized"
+AMEX_SANDBOX_SEN = {
+    "GBP": "7492256953", "IDR": "7492258264", "AED": "7492256961", "KWD": "7492256979",
+    "CHF": "7492256987", "OMR": "7492256995", "MXN": "7492257001", "PHP": "7492257019",
+    "EUR": "7492257027", "JPY": "7492258942", "VND": "7492258959", "AUD": "7492258967",
+    "ZAR": "7492258231", "USD": "7492258975", "SEK": "7492258926", "NOK": "7492258991",
+    "TWD": "7492258272", "SAR": "7492257258", "CAD": "7492257266", "QAR": "7492257274",
+    "MYR": "7492257282", "CNY": "7492258280", "NZD": "7492257357", "DKK": "7492257365",
+    "SGD": "7492257373", "RON": "7492258132", "THB": "7492258140", "KRW": "7492258157",
+    "ILS": "7492258181", "GEL": "7492258199", "PLN": "7492258207", "HKD": "7492258223",
+}
+# payment_instrument sub-objects that are the merchant's real bank account. Not carried;
+# the step is BLOCKED until a sandbox test account is supplied as manual values.
+PROD_PAYOUT_MANUAL = ("payment_instrument.bank_details",
+                      "payment_instrument.account_holder_details")
+# Personal contact fields that ARE carried from prod, flagged once (Patrick, 2026-09-09).
+PROD_CONTACT_FIELDS = ("client.email", "processing_profile.card_acceptor_email",
+                       "processing_profile.card_acceptor_phone")
+# Keys masked at every depth when a PROD capture or journal is written to disk.
+REDACT_KEYS = frozenset({
+    "iban", "account_number", "bank_code", "swift_bic", "intermediary_swift_bic",
+    "bank_name", "branch_name", "account_holder_details", "bank_details",
+    "credentials", "mid", "mid_for_payment", "token", "reporting_auth_key",
+    "sensitive_password", "password", "username", "project_api_key", "secret",
+    "temporary_secret", "authorization_key", "card_acceptor_identification_code",
+    "card_acceptor_id", "service_establishment_number", "email", "card_acceptor_email",
+    "card_acceptor_phone", "phone", "customer_service_phone_number",
+    "additional_contact_number", "customer_support_contact_number", "headers", "signature",
+    "url",   # a webhook action's receiver — a production endpoint
+    "siret", "merchant_id", "ideal_merchant_id", "contract_number", "customer_number",
+    "project_api_key", "card_acceptor_tax_id",   # acquirer / contract identifiers
+})
+
+
+def redact_for_disk(obj):
+    """Mask sensitive values at every depth, keeping shapes. Applied to a PROD capture
+    before it is saved and to every PROD journal line. Strings become "REDACTED(n)"; nested
+    objects under a sensitive key are replaced by one such string too."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in REDACT_KEYS and v not in (None, "", [], {}):
+                out[k] = f"REDACTED({len(json.dumps(v, default=str))})"
+            else:
+                out[k] = redact_for_disk(v)
+        return out
+    if isinstance(obj, list):
+        return [redact_for_disk(x) for x in obj]
+    return obj
 
 # Some sandbox clients have no webpage URL, and the network-tokens create rejects the body
 # without one (learned live: 422 primary_url_required). Sent in its place and flagged as a
@@ -444,6 +524,8 @@ class Reader:
         # that raises is swallowed — it can never change what a read returns (same
         # contract as apply_plan's on_step). capture() attaches one to stamp phases.
         self.on_call = None
+        # lists whose pages could not be read up to total_count — build_plan flags these
+        self.truncated = []
 
     def _fetch(self, path):
         """One HTTP GET -> (json, status). The seam tests replace to answer from fixtures."""
@@ -473,6 +555,32 @@ class Reader:
         d, code = self.get(path)
         return ((d.get("_embedded") or {}).get(key) or []), code
 
+    def hal_all(self, path, key, limit=25, max_pages=400):
+        """Every item of a paginated HAL list, following limit/skip/total_count.
+
+        CAT lists come back as {limit, skip, total_count, _embedded: {key: [...]}}. Until
+        2026-09-09 one page of 25 was read — a silent truncation above 25, unlikely in
+        sandbox and likely on a production client. This keeps asking until total_count is
+        reached or a short page arrives. Returns (items, code) like hal(); a list that
+        could not be completed is recorded in self.truncated so build_plan flags it rather
+        than trusting it.
+        """
+        sep = "&" if "?" in path else "?"
+        items, skip, code, total = [], 0, 0, None
+        for _ in range(max_pages):
+            d, code = self.get(f"{path}{sep}limit={limit}&skip={skip}")
+            d = d if isinstance(d, dict) else {}
+            page = (d.get("_embedded") or {}).get(key) or []
+            items.extend(page)
+            skip += len(page)
+            if isinstance(d.get("total_count"), int):
+                total = d["total_count"]
+            if not page or len(page) < limit or (total is not None and skip >= total):
+                break
+        if total is not None and len(items) < total:
+            self.truncated.append({"path": path, "read": len(items), "total": total})
+        return items, code
+
 
 # ---------------------------------------------------------------- webhooks (Workflows)
 
@@ -488,7 +596,12 @@ WORKFLOW_DROP = {"id", "_links", "created_at", "updated_at"}
 # would otherwise be echoed back into a create that never asked for it.
 WORKFLOW_FIELDS = {"name", "active", "conditions", "actions"}
 WORKFLOW_CONDITION_FIELDS = {"type", "events", "entities", "processing_channels"}
-WORKFLOW_ACTION_FIELDS = {"type", "url", "headers", "signature"}
+# Per action TYPE. An action of a type not listed here is never sent hollow: a workflow
+# carrying one is skipped and flagged (an `aws` action sent as {"type": "aws"} failed with
+# region_required — prod run 2026-09-09T15:17Z; 3 of the 27 source actions were aws).
+#   webhook — HTTP receiver; aws — Amazon EventBridge partner event source (account + region)
+WORKFLOW_ACTION_FIELDS = {"webhook": {"type", "url", "headers", "signature"},
+                          "aws": {"type", "account_id", "region"}}
 # condition type -> the field carrying source ids that must be remapped on the clone
 WORKFLOW_SCOPED_CONDITIONS = {"entity": "entities", "processing_channel": "processing_channels"}
 
@@ -538,7 +651,9 @@ def read_event_types(reader):
 def workflow_create_body(wf, entity_ids, channel_ids, event_types=None):
     """Turn a source workflow detail into an add-workflow-request body.
 
-    Returns (body, requires, notes, emptied, dropped_events). Ids and _links are stripped
+    Returns (body, requires, notes, emptied, dropped_events, unsupported_action_types) —
+    the last names action types WORKFLOW_ACTION_FIELDS does not know (such a workflow must
+    be skipped, not created without those actions). Ids and _links are stripped
     at every level; entity and processing-channel conditions are remapped to placeholders
     for the clone's ids, and any id outside the capture's scope is dropped with a note.
     `emptied` names a condition type whose list became empty — such a workflow must not be
@@ -587,9 +702,17 @@ def workflow_create_body(wf, entity_ids, channel_ids, event_types=None):
             requires.extend(kept)
         conds.append(c)
     body["conditions"] = conds
-    body["actions"] = [{k: v for k, v in a.items() if k in WORKFLOW_ACTION_FIELDS}
-                       for a in body.get("actions") or []]
-    return body, requires, notes, emptied, dropped_events
+    # Per action TYPE allowlist. A type the create is not known to accept is reported, not
+    # sent as a hollow {"type": …} that CAT then rejects for a missing field.
+    actions, unsupported = [], []
+    for a in body.get("actions") or []:
+        fields = WORKFLOW_ACTION_FIELDS.get((a or {}).get("type"))
+        if fields is None:
+            unsupported.append((a or {}).get("type"))
+            continue
+        actions.append({k: v for k, v in a.items() if k in fields})
+    body["actions"] = actions
+    return body, requires, notes, emptied, dropped_events, sorted({u for u in unsupported if u} | ({None} if None in unsupported else set()), key=str)
 
 
 # ---------------------------------------------------------------- API keys (destination)
@@ -674,8 +797,16 @@ CAPTURE_ENTITY_SUBS = ("detail", "currency_accounts", "processing_profiles",
 
 
 def capture(base, token, client_id, only_entity=None, only_entities=None,
-            sandbox_secret_key=None, sandbox_api_base=SANDBOX_API_BASE, on_progress=None):
+            sandbox_secret_key=None, sandbox_api_base=SANDBOX_API_BASE, on_progress=None,
+            source_env="sandbox", target_base=None, target_token=None):
     """Read the source configuration. Returns a raw capture dict.
+
+    source_env / target_base / target_token: Prod -> Sandbox. `base`/`token` are then the
+    PRODUCTION CAT and its token (reads only — nothing here writes); the platform-capability
+    reads (which currencies CAT accepts, which API-key scopes exist) go to the TARGET
+    sandbox CAT instead, because that is where the creates land. The NT portal is not read
+    in prod mode (its production host is not known to this tool) and the plan says so.
+    cap["source_env"] records the mode; build_plan scrubs production-only data from it.
 
     on_progress: optional callable(entry) fired once per completed read, with
     {seq, kind, sub, entity_index, entity_total, method, path, status} — what has
@@ -694,9 +825,13 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
     they are not read, cap["workflows_source"] is "no_key", and the plan flags that.
     """
     r = Reader(base, token)
+    prod = source_env == "prod"
+    # Prod -> Sandbox: a second CAT reader for the TARGET. Capability reads (currency
+    # lists, API-key scopes) describe where the creates land, not where the source lives.
+    rt = Reader(target_base, target_token) if (prod and target_base and target_token) else None
     cap = {"client_id": client_id, "entities": [], "only_entity": only_entity,
            "only_entities": sorted({*(only_entities or []), *([only_entity] if only_entity else [])}) or None,
-           "scope_missing": []}
+           "scope_missing": [], "source_env": source_env}
 
     # Progress stamping. `state` is what phase the NEXT reads belong to; mark() moves it
     # at the section boundaries below. The hook is attached to every Reader this capture
@@ -717,6 +852,8 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
         state.update(kind=kind, sub=sub, **fields)
 
     r.on_call = hook
+    if rt is not None:
+        rt.on_call = hook
 
     mark("client", "client")
     cap["client"], _ = r.get(f"/clients/{client_id}")
@@ -742,7 +879,10 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
     # lands in _meta.errors and the plan flags exactly that.
     cat_nt, _ = r.get(f"/clients/{client_id}/network-tokens")
     portal_nt = None
-    if not (network_token_form_values(cat_nt) or {}).get("default_entity_id"):
+    if prod:
+        # The NT portal's production host is not known to this tool: not read, flagged.
+        pass
+    elif not (network_token_form_values(cat_nt) or {}).get("default_entity_id"):
         rp = Reader(NT_PORTAL_BASE, token)
         rp.on_call = hook
         portal_nt, _ = rp.get(f"/{client_id}")
@@ -750,9 +890,11 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
         r.errors.extend(rp.errors)
     cap["network_tokens"], cap["network_tokens_source"] = \
         choose_network_tokens_form(cat_nt, portal_nt)
+    if prod:
+        cap["network_tokens"], cap["network_tokens_source"] = None, "not_read_prod"
     cap["network_tokens_cat_raw"] = cat_nt      # kept for diagnosis
     mark("entities", "list")
-    ents, _ = r.hal(f"/clients/{client_id}/entities?limit=25&skip=0", "entities")
+    ents, _ = r.hal_all(f"/clients/{client_id}/entities", "entities")
     ents, cap["scope_missing"] = scope_entities(ents, only_entity, only_entities)
     # from here on every stamp carries how many entities there are to read
     mark("entities", "list", entity_total=len(ents))
@@ -765,11 +907,11 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
 
         mark("entity", "currency_accounts")
         ent["currency_accounts"], _ = r.hal(
-            f"/entities/{eid}/currency-accounts?limit=25&skip=0", "currency_accounts")
+            f"/entities/{eid}/currency-accounts", "currency_accounts")
 
         # profiles: list gives ids, v2 detail gives the clonable custom_settings
         mark("entity", "processing_profiles")
-        plist, _ = r.hal(f"/entities/{eid}/processing-profiles?limit=25&skip=0",
+        plist, _ = r.hal_all(f"/entities/{eid}/processing-profiles",
                          "processing_profiles")
         ent["processing_profiles"] = []
         for p in plist:
@@ -781,7 +923,7 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
         # recover billing_information / authorization_key / acquirer_settings, none of
         # which appear in the channel's nested processors[] array.
         mark("entity", "processing_channels")
-        clist, _ = r.hal(f"/entities/{eid}/processing-channels?limit=25&skip=0",
+        clist, _ = r.hal_all(f"/entities/{eid}/processing-channels",
                          "processing_channels")
         ent["processing_channels"] = []
         for c in clist:
@@ -799,7 +941,7 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
         # services: {"value": "vault", ...} rather than {"type": "vault", ...}.
         mark("entity", "sessions_channels")
         slist, _ = r.hal(
-            f"/entities/{eid}/sessions-processing-channels?limit=25&skip=0",
+            f"/entities/{eid}/sessions-processing-channels",
             "sessions_processing_channels")
         ent["sessions_channels"] = []
         for s in slist:
@@ -810,7 +952,7 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
         for kind, seg, key in (("payment_routing", "payment-routing-rules", "routing_rules"),
                                ("payout_routing", "payout-routing-rules", "routing_rules")):
             mark("entity", kind)
-            lst, _ = r.hal(f"/entities/{eid}/{seg}?limit=25&skip=0", key)
+            lst, _ = r.hal_all(f"/entities/{eid}/{seg}", key)
             out = []
             for x in lst:
                 d, code = r.get(f"/{seg}/{x['id']}")
@@ -818,7 +960,7 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
             ent[kind] = out
 
         mark("entity", "payout_settings")
-        pset, _ = r.hal(f"/entities/{eid}/payout-settings?limit=25&skip=0", "payout_settings")
+        pset, _ = r.hal_all(f"/entities/{eid}/payout-settings", "payout_settings")
         ent["payout_settings"] = []
         for s in pset:
             d, code = r.get(f"/entities/{eid}/payout-settings/{s['id']}")
@@ -847,19 +989,22 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
     # parsing is defensive and an unrecognised response yields None ("unavailable")
     # rather than an empty set ("nothing is valid"), which would drop every currency.
     cur = {"global": None, "by_acquirer": {}, "payout_routes": {},
-           "holding": None, "unavailable": []}
+           "holding": None, "unavailable": [], "acquirer_status": {},
+           # which CAT answered: the target (prod -> sandbox) or the source (same env)
+           "read_from": "target" if rt is not None else "source"}
+    rv = rt or r    # capability reads go to the TARGET when the source is production
 
-    d, code = r.get("/configuration/currencies")
+    d, code = rv.get("/configuration/currencies")
     cur["global"] = parse_currency_codes(d)
     if cur["global"] is None:
         cur["unavailable"].append(f"/configuration/currencies (HTTP {code})")
 
-    d, code = r.get("/currency-accounts/configuration")
+    d, code = rv.get("/currency-accounts/configuration")
     cur["holding"] = parse_currency_codes(d)
     if cur["holding"] is None:
         cur["unavailable"].append(f"/currency-accounts/configuration (HTTP {code})")
 
-    d, code = r.get("/payout-routes/configuration")
+    d, code = rv.get("/payout-routes/configuration")
     cur["payout_routes"] = payout_route_currencies(d)
     if not cur["payout_routes"]:
         cur["unavailable"].append(f"/payout-routes/configuration (HTTP {code})")
@@ -878,8 +1023,12 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
                     acquirers.add(pr["acquirer_id"])
     mark("validity", "acquirers")
     for a in sorted(acquirers):
-        d, code = r.get("/processors/configuration/currencies?acquirerId="
-                        + urllib.parse.quote(a))
+        d, code = rv.get("/processors/configuration/currencies?acquirerId="
+                         + urllib.parse.quote(a))
+        # Doubles as an existence check on the target: a definitive 400/404 for an
+        # acquirer the source uses means the target has no such acquirer (prod -> sandbox
+        # catalogues differ), and build_plan skips its profiles rather than fail mid-run.
+        cur["acquirer_status"][a] = code
         parsed = parse_currency_codes(d)
         if parsed is None:
             cur["unavailable"].append(
@@ -898,7 +1047,11 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
     # plan can mint the destination's two keys with every scope of the right side —
     # Patrick's known-good calls used exactly that. side_label is "secret" or "public".
     mark("api_key_scopes", "catalogue")
-    d, code = r.get(f"/access-keys/configuration?clientId={client_id}")
+    d, code = rv.get(f"/access-keys/configuration?clientId={client_id}")
+    if not (200 <= code < 300) and rt is not None:
+        # the target may not know the SOURCE's client id; the catalogue is platform-wide,
+        # so the source's own CAT is an acceptable second answer
+        d, code = r.get(f"/access-keys/configuration?clientId={client_id}")
     cap["api_key_scopes"] = api_key_scopes_from(d) if 200 <= code < 300 else None
 
     # Webhooks: the one read against the Checkout sandbox API rather than CAT. Needs the
@@ -917,7 +1070,12 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
         cap["workflows"], cap["workflows_source"] = None, "no_key"
         cap["workflow_event_types"] = None
 
-    cap["_meta"] = {"calls": r.calls, "errors": r.errors}
+    if rt is not None:
+        r.calls += rt.calls
+        r.errors.extend(rt.errors)
+        r.truncated.extend(rt.truncated)
+    cap["_meta"] = {"calls": r.calls, "errors": r.errors, "truncated": r.truncated,
+                    "source_env": source_env}
     return cap
 
 
@@ -994,6 +1152,24 @@ def _as_str(v):
 # A CAT id: <prefix>_<20+ lowercase alphanumerics>. Used to spot a SOURCE id still
 # sitting in a value after remapping, which is otherwise invisible until CAT rejects it.
 SOURCE_ID_RE = re.compile(r"[a-z][a-z0-9]*_[a-z0-9]{20,}")
+
+
+def prism_key_token(eid):
+    """The id-map token for the prism key CAT mints for the CLONE's entity.
+
+    Read back at apply time by the `prism_service_check` step (GET /entities/{id}/services
+    -> prism.prism_key, the client|entity composite) and referenced by any channel whose
+    source prism key is not the remappable composite — a legacy opaque id such as
+    8b325f8617da4c30927d529ff823387d (prod run 2026-09-09T13:40Z, step 43). Shaped like a
+    source id (prefix_26) so a dry run mints a synthetic value for it like any other.
+    """
+    return "prismkey_" + eid.split("_", 1)[1]
+
+
+def is_composite_prism_key(key, client_id, entity_id):
+    """True when a prism service key is the remappable client|entity composite for the
+    given source client and entity — the only form the remapper can carry across."""
+    return isinstance(key, str) and key == f"{client_id}|{entity_id}"
 
 
 def service_key_ids(src_cli, src_vault, eid, ent):
@@ -1076,11 +1252,14 @@ def resolve_legal_entity_codes(entity_detail, profiles):
                   + (f" (entity default_cko_legal_entity={hint})" if hint else ""))
 
 
-def profile_create_body(detail, fallback_legal_codes=None, valid_currencies=None):
+def profile_create_body(detail, fallback_legal_codes=None, valid_currencies=None,
+                        prod=False):
     """Shape a captured v2 profile detail into a create body.
 
     The GET is not a create body, and for profiles the gap is more than the usual
     server-assigned fields — see PROFILE_STRING_FIELDS above and the CAID note below.
+    prod=True (Prod -> Sandbox): production acquirer credentials are stripped from
+    custom_settings and the CAID is always regenerated — see PROD_PROFILE_STRIP.
 
     Returns (body, notes, warnings).
     """
@@ -1164,6 +1343,72 @@ def profile_create_body(detail, fallback_legal_codes=None, valid_currencies=None
             cs["SE_CCY"] = rows
             if hit:
                 coerced.append("custom_settings.SE_CCY[].processing_threshold")
+        if prod:
+            # Production acquirer credentials and contract identifiers never reach sandbox
+            # (sandbox acquirers have their own). Sandbox reads carry these masked ("0"),
+            # production reads carry the real values.
+            stripped = [f for f in PROD_PROFILE_STRIP if f in cs]
+            for f in stripped:
+                cs.pop(f, None)
+            if cs.get("siret"):
+                # required by the create for a French acquirer profile; a placeholder that
+                # passes validation, never the production registration number
+                cs["siret"] = SANDBOX_SIRET_PLACEHOLDER
+                warns.append(make_flag(
+                    "prod_siret_placeholder",
+                    f"profile '{detail.get('name') or detail.get('id')}' will still be "
+                    f"created, but its production SIRET is replaced by the placeholder "
+                    f"{SANDBOX_SIRET_PLACEHOLDER} — it passes CAT's validation and is not a "
+                    f"real registration; the create requires one (siret_required)",
+                    kind="processing_profile", object_id=detail.get("id"),
+                    placeholder=SANDBOX_SIRET_PLACEHOLDER, action="substituted"))
+            se = cs.get("SE_CCY")
+            if isinstance(se, list) and se:
+                # Amex: one sandbox SE number per currency (AMEX_SANDBOX_SEN, oversized tier),
+                # never the production one. A currency sandbox has no SE number for cannot
+                # be processed on Amex there: its row goes, and so does the currency.
+                kept, no_sen = [], []
+                for rw in se:
+                    if not isinstance(rw, dict):
+                        continue
+                    ccy = rw.get("currency")
+                    sen = AMEX_SANDBOX_SEN.get(ccy)
+                    if sen:
+                        kept.append(dict(rw, service_establishment_number=sen))
+                    else:
+                        no_sen.append(ccy)
+                cs["SE_CCY"] = kept
+                cs["merchant_size"] = AMEX_SANDBOX_MERCHANT_SIZE
+                if no_sen:
+                    body["currencies"] = [c for c in (body.get("currencies") or [])
+                                          if c not in no_sen]
+                    warns.append(make_flag(
+                        "prod_sen_currency_unavailable",
+                        f"profile '{detail.get('name') or detail.get('id')}' will still be "
+                        f"created, but {', '.join(no_sen)} cannot be processed on Amex in "
+                        f"sandbox (no sandbox service establishment number for the currency) "
+                        f"and is left out of its SE_CCY rows and currencies",
+                        kind="processing_profile", object_id=detail.get("id"),
+                        currencies=no_sen, action="dropped"))
+                if kept:
+                    warns.append(make_flag(
+                        "prod_sen_sandbox_oversized",
+                        f"profile '{detail.get('name') or detail.get('id')}' will still be "
+                        f"created, but its production Amex service establishment numbers are "
+                        f"replaced by sandbox's own (merchant_size {AMEX_SANDBOX_MERCHANT_SIZE}) "
+                        f"for {', '.join(r['currency'] for r in kept)}",
+                        kind="processing_profile", object_id=detail.get("id"),
+                        currencies=[r["currency"] for r in kept],
+                        merchant_size=AMEX_SANDBOX_MERCHANT_SIZE, action="substituted"))
+            if stripped:
+                warns.append(make_flag(
+                    "prod_credentials_stripped",
+                    f"profile '{detail.get('name') or detail.get('id')}' will still be "
+                    f"created, but its production acquirer credentials are left out: "
+                    f"custom_settings.{', custom_settings.'.join(stripped)} — sandbox "
+                    f"acquirers use their own",
+                    kind="processing_profile", object_id=detail.get("id"),
+                    fields=stripped, action="dropped"))
         body["custom_settings"] = cs
     if coerced:
         notes.append("coerced to string for the create (the v2 GET returns these as "
@@ -1193,6 +1438,18 @@ def profile_create_body(detail, fallback_legal_codes=None, valid_currencies=None
                     notes.append(f"card_acceptor_identification_code blanked (source had "
                                  f"{src_caid}) — CAT assigns it per entity when "
                                  f"auto_generate_card_acceptor_identification_code is true")
+                elif prod:
+                    # A production CAID is meaningless in sandbox, which assigns its own:
+                    # blank it and ask CAT to generate, whatever the source's flag said.
+                    row["card_acceptor_identification_code"] = ""
+                    body["auto_generate_card_acceptor_identification_code"] = True
+                    warns.append(make_flag(
+                        "prod_caid_regenerated",
+                        f"profile '{detail.get('name') or detail.get('id')}' will still be "
+                        f"created, but its production card acceptor id is not carried — "
+                        f"CAT assigns a sandbox one (auto_generate forced on)",
+                        kind="processing_profile", object_id=detail.get("id"),
+                        action="dropped"))
                 else:
                     # No known-good call covers this combination, so do not guess which
                     # way it goes: say so and let the operator decide.
@@ -1328,6 +1585,12 @@ def build_plan(cap, target_client_name=None):
     steps, skipped, warnings, flags = [], [], [], []
     src_cli = cap["client_id"]
     client = cap.get("client") or {}
+    # Prod -> Sandbox: production-only data is scrubbed below (PROD_* tables) and each
+    # scrub is flagged. skipped_profiles collects profiles whose acquirer the target does
+    # not have, so their processors are skipped too instead of failing mid-run.
+    prod = cap.get("source_env") == "prod"
+    skipped_profiles = set()
+    prod_processor_scrubs = []     # (processor label, [fields]) — flagged once per entity
 
     def flag(f):
         """Record a non-halting finding, and mirror its message into warnings."""
@@ -1364,11 +1627,16 @@ def build_plan(cap, target_client_name=None):
 
     def add(kind, method, path, body, provides=None, requires=(), op=None, notes=None,
             entity=None, label=None, parent=None, provides_from=None, retry=None,
-            verify=None, optional=False, base=None, auth=None):
+            verify=None, optional=False, base=None, auth=None, needs_manual=None):
         steps.append({"seq": len(steps) + 1, "kind": kind, "op": op, "method": method,
                       "path": path, "body": body,
                       "provides": provides, "requires": sorted(set(requires)),
                       "notes": notes or [],
+                      # needs_manual: dotted body paths the operator must supply as manual
+                      # values ("<seq>.<path>") before the step may be sent — production
+                      # data that is never carried (bank details). clone_apply BLOCKS the
+                      # step until every path is present.
+                      "needs_manual": list(needs_manual or []),
                       # auth: which credential sends this step. None/"cat" = the CAT
                       # token; "sandbox_secret" = the DESTINATION client's sk_sbox_ against
                       # the Checkout sandbox API (clone_apply.bearer_for). A step that
@@ -1653,11 +1921,31 @@ def build_plan(cap, target_client_name=None):
         # Resolved once per entity: the legal entity code tracks the entity, so every
         # profile that cannot report its own takes the entity's consensus value.
         legal_codes = resolve_legal_entity_codes(det, ent.get("processing_profiles"))
+        acq_status = (cap.get("valid_currencies") or {}).get("acquirer_status") or {}
         for p in ent.get("processing_profiles", []):
+            pdet = p.get("detail") or {}
+            acq = pdet.get("acquirer_key")
+            if prod and acq and acq_status.get(acq) in (400, 404):
+                # The TARGET answered definitively that it has no such acquirer. A create
+                # naming it would fail mid-run and take every processor on this profile
+                # with it; refuse up front and say so.
+                skipped_profiles.add(p["id"])
+                skipped.append({"kind": "processing_profile", "entity": eid,
+                                "profile": p["id"],
+                                "reason": f"acquirer {acq} is not available in sandbox "
+                                          f"(HTTP {acq_status.get(acq)} from the target's "
+                                          f"acquirer configuration)"})
+                flag(make_flag(
+                    "acquirer_not_in_sandbox",
+                    f"profile '{profile_label(pdet)}' is not created: its acquirer {acq} "
+                    f"does not exist in sandbox (the target returned HTTP "
+                    f"{acq_status.get(acq)}). Its processors are skipped with it.",
+                    kind="processing_profile", entity=eid, object_id=p["id"],
+                    acquirer=acq, action="not_created"))
+                continue
             body, pnotes, pwarns = profile_create_body(
-                p.get("detail") or {}, fallback_legal_codes=legal_codes,
-                valid_currencies=valid_currency_set(
-                    cap, acquirer=(p.get("detail") or {}).get("acquirer_key")))
+                pdet, fallback_legal_codes=legal_codes,
+                valid_currencies=valid_currency_set(cap, acquirer=acq), prod=prod)
             for f in pwarns:
                 flag(f)
             n = list(pnotes)
@@ -1705,6 +1993,26 @@ def build_plan(cap, target_client_name=None):
                        "idempotent: enabling an already-enabled service is a no-op",
                        "NOT reversible by cleanup — there is no removal route for an "
                        "entity service"])
+            # 4c — read the clone's prism key back and ASSERT the service exists before any
+            # channel references it. GET /entities/{id}/services returns
+            # prism.{is_enabled, prism_key} — the client|entity composite CAT minted for
+            # the clone (seen on every live prism PUT response). The key is captured into
+            # the id map (provides_from), so a channel whose SOURCE prism key is a legacy
+            # opaque id (not the remappable composite) can reference the clone's REAL key,
+            # derived from the cloned configuration rather than assumed. If the read
+            # returns no key, the placeholder never resolves and the channel is blocked —
+            # never sent with a key that does not belong to the clone.
+            add("prism_service_check", "GET", f"/entities/{ph(eid)}/services", None,
+                provides=prism_key_token(eid), provides_from="prism.prism_key",
+                requires=[eid], entity=eid, op="Entities_GetEntityServices",
+                label="read back the clone's prism service key",
+                # optional: if the read returns no key, only the channels that reference
+                # it are affected — each blocks on its placeholder, never sent with a guess
+                optional=True,
+                verify={"compare": "prism_service",
+                        "expected": {"client": ph(src_cli), "entity": ph(eid)}},
+                notes=["captures prism.prism_key for channels whose source key is a legacy "
+                       "opaque id; asserts prism.is_enabled on the clone's entity"])
 
         # 5/6 — channels, then their processors (profile_id must be derived).
         # Processors that cannot be created are collected so their sessions
@@ -1722,6 +2030,31 @@ def build_plan(cap, target_client_name=None):
             for svc in (cbody.get("services") or []):
                 key = (svc or {}).get("key")
                 if not isinstance(key, str) or not key:
+                    continue
+                if svc.get("type") == "prism" and not is_composite_prism_key(key, src_cli, eid):
+                    # A prism key that is not the client|entity composite — a legacy opaque
+                    # id (32 hex chars on the prod source, 2026-09-09) or anything else the
+                    # remapper cannot carry — is never passed through: the clone's prism
+                    # service does not know it (invalid_prism_merchant_service). The
+                    # channel references the key CAT minted for the clone's entity, read
+                    # back and asserted by prism_service_check just before this step.
+                    tok = prism_key_token(eid)
+                    svc["key"] = ph(tok)
+                    creq.append(tok)
+                    cnotes.append("prism service key is a legacy opaque id, not the "
+                                  "remappable client|entity composite — replaced by the "
+                                  "clone's own prism key, read back by prism_service_check "
+                                  "(the original value is on the prism_key_normalised flag)")
+                    flag(make_flag(
+                        "prism_key_normalised",
+                        f"channel {c['id']}: its prism service key {key} is a legacy opaque "
+                        f"id, not the client|entity composite, and cannot be carried to the "
+                        f"clone. The clone's channel uses the prism key CAT minted for the "
+                        f"clone's entity instead (GET /entities/{{entity}}/services -> "
+                        f"prism.prism_key, read back and asserted before this step).",
+                        kind="processing_channel", entity=eid, object_id=c["id"],
+                        original_key=key, replacement=f"{{{{{tok}}}}} (the clone's prism.prism_key)",
+                        action="substituted"))
                     continue
                 svc["key"], used = remap_service_key(key, known)
                 if used:
@@ -1764,6 +2097,14 @@ def build_plan(cap, target_client_name=None):
                     pid, conf = None, "direct-mode (inline acquirer_settings)"
                 else:
                     pid, conf = resolve_profile_id(pr, ent.get("processing_profiles", []))
+                if pid and pid in skipped_profiles:
+                    # its profile was refused (acquirer not in sandbox) — nothing to bind to
+                    skipped.append({"kind": "processor", "entity": eid, "channel": c["id"],
+                                    "processor": pr.get("id"),
+                                    "reason": f"its profile {pid} was skipped (acquirer "
+                                              f"not available in sandbox)"})
+                    skipped_processors.add(pr.get("id"))
+                    continue
                 if not pid:
                     reason = (f"binds no processing profile ({conf}); CAT cannot create a "
                               f"manual processor — the create endpoint returns "
@@ -1787,6 +2128,24 @@ def build_plan(cap, target_client_name=None):
                 req = [c["id"], pid]
                 body["profile_id"] = ph(pid)
                 notes = [f"profile_id derived ({conf}) — not readable from any GET"]
+                if prod:
+                    # Environment-bound: a production authorization key and card acceptor
+                    # ids mean nothing in sandbox, which assigns its own.
+                    pscrub = []
+                    if body.pop("authorization_key", None) is not None:
+                        pscrub.append("authorization_key")
+                    bi = body.get("billing_information")
+                    if isinstance(bi, dict) and bi.get("card_acceptor_id"):
+                        bi = dict(bi); bi["card_acceptor_id"] = ""
+                        body["billing_information"] = bi
+                        pscrub.append("billing_information.card_acceptor_id")
+                    if body.get("card_acceptor_identification_code"):
+                        body["card_acceptor_identification_code"] = ""
+                        pscrub.append("card_acceptor_identification_code")
+                    if pscrub:
+                        notes.append("prod source: not carried (environment-bound) — "
+                                     + ", ".join(pscrub))
+                        prod_processor_scrubs.append((pr.get("name") or pr.get("id"), pscrub))
                 # A processor carries currency codes too, under TWO different field
                 # names. The global currency rules apply to both.
                 for f in ("currencies", "processing_currencies"):
@@ -2075,6 +2434,27 @@ def build_plan(cap, target_client_name=None):
             pi = dict(body.get("payment_instrument") or {})
             for k in ("id", "date_created", "date_modified", "e_tag"):
                 pi.pop(k, None)
+            needs_manual = []
+            if prod:
+                # The merchant's real bank account never leaves production. The step is
+                # BLOCKED until a sandbox test account is supplied as manual values
+                # (Patrick, 2026-09-04: require it, do not skip the payout setting).
+                removed = [k for k in ("bank_details", "account_holder_details")
+                           if pi.pop(k, None) is not None]
+                if removed:
+                    needs_manual = [f"payment_instrument.{k}" for k in removed]
+                    pnotes.append("prod source: " + ", ".join(needs_manual)
+                                  + " not carried — supply a sandbox test account as "
+                                    "manual values before applying")
+                    flag(make_flag(
+                        "prod_bank_details_not_carried",
+                        f"payout setting '{(s.get('payout_schedule') or {}).get('name') or 'payout instruction'}' "
+                        f"on entity {eid}: the production bank account "
+                        f"({', '.join(removed)}) is not carried. The step is blocked until "
+                        f"a sandbox test account is supplied as manual values "
+                        f"({', '.join(needs_manual)}).",
+                        kind="payout_setting", entity=eid, fields=needs_manual,
+                        action="not_supplied"))
             if pi.get("vault_account_id") and pi["vault_account_id"] == src_vault:
                 pi["vault_account_id"] = ph(src_vault)
                 preq.append(src_vault)
@@ -2115,9 +2495,10 @@ def build_plan(cap, target_client_name=None):
             add("payout_setting", "POST", f"/entities/{ph(eid)}/payout-settings",
                 body, provides=None, requires=preq, entity=eid,
                 label=(s.get("payout_schedule") or {}).get("name") or "payout instruction",
-                op="PayoutSettings_CreatePayoutSetting",
-                notes=pnotes + ["bank details are carried through from the CAT read — "
-                                "check them against the target before applying"])
+                op="PayoutSettings_CreatePayoutSetting", needs_manual=needs_manual,
+                notes=pnotes + ([] if prod else
+                                ["bank details are carried through from the CAT read — "
+                                 "check them against the target before applying"]))
         # 11 — payout routes: PARITY CHECK, never a create.
         #
         # A payout route is a supported payout corridor available to the entity — country
@@ -2340,8 +2721,42 @@ def build_plan(cap, target_client_name=None):
         expected = []
         for wf in wfs:
             name = wf.get("name") or wf.get("id") or "unnamed workflow"
-            body, req, notes, emptied, dropped_events = workflow_create_body(
+            body, req, notes, emptied, dropped_events, unsupported = workflow_create_body(
                 wf, ent_ids, ch_ids, event_types)
+            if unsupported:
+                # An action type the create is not known to accept: skip the whole workflow
+                # rather than create it without that action (it would silently do less).
+                skipped.append({"kind": "webhook_workflow",
+                                "reason": f"workflow '{name}': action type(s) "
+                                          f"{', '.join(map(str, unsupported))} are not supported "
+                                          f"by this tool"})
+                flag(make_flag(
+                    "webhook_action_unsupported",
+                    f"WEBHOOK WORKFLOW '{name}' MUST BE CREATED MANUALLY ON THE DESTINATION "
+                    f"CLIENT — it carries action type(s) {', '.join(map(str, unsupported))} "
+                    f"this tool does not know how to create",
+                    kind="webhook_workflow", object_id=wf.get("id"),
+                    action_types=[str(u) for u in unsupported], action="not_created"))
+                continue
+            non_http = [a for a in body["actions"] if a.get("type") != "webhook"]
+            if prod and non_http:
+                # Prod -> Sandbox: an aws action targets the merchant's PRODUCTION AWS
+                # account/region — the same class as a production receiver URL. There is no
+                # sandbox substitute to offer, so the workflow is a manual step.
+                skipped.append({"kind": "webhook_workflow",
+                                "reason": f"workflow '{name}': its {', '.join(sorted({a['type'] for a in non_http}))} "
+                                          f"action(s) target production infrastructure"})
+                flag(make_flag(
+                    "webhook_aws_manual",
+                    f"WEBHOOK WORKFLOW '{name}' MUST BE CREATED MANUALLY ON THE DESTINATION "
+                    f"CLIENT — its {', '.join(sorted({a['type'] for a in non_http}))} action(s) "
+                    f"deliver to the merchant's production AWS "
+                    f"({', '.join(sorted({a.get('region') or '?' for a in non_http}))}); "
+                    f"sandbox events must not be sent there",
+                    kind="webhook_workflow", object_id=wf.get("id"),
+                    actions=[{"type": a.get("type"), "region": a.get("region")} for a in non_http],
+                    action="not_created"))
+                continue
             for source, ev in dropped_events:
                 # Flagged, not fatal: the workflow is still created without the event.
                 flag(make_flag(
@@ -2360,15 +2775,51 @@ def build_plan(cap, target_client_name=None):
                     f"names only objects outside this capture's scope",
                     kind="webhook_workflow", object_id=wf.get("id"), action="not_created"))
                 continue
-            for a in body["actions"]:
-                if a.get("type") == "webhook" and a.get("url"):
+            if prod:
+                # A production receiver must never get sandbox events. Every webhook action
+                # is pointed at the one sandbox receiver the operator typed; its headers
+                # and signing key (production secrets) are dropped. No receiver typed →
+                # the workflow is a manual step, not a guess.
+                receiver = (cap.get("webhook_receiver_url") or "").strip()
+                hooks = [a for a in body["actions"] if a.get("type") == "webhook"]
+                if hooks and not receiver:
+                    skipped.append({"kind": "webhook_workflow",
+                                    "reason": f"workflow '{name}': production receiver not "
+                                              f"carried and no sandbox receiver URL given"})
                     flag(make_flag(
-                        "webhook_url_carried",
-                        f"webhook workflow '{name}' will deliver to {a['url']} — the "
-                        f"source's receiver, carried as-is with its headers and signing "
-                        f"key. Confirm that is the intended endpoint for the clone.",
-                        kind="webhook_workflow", object_id=wf.get("id"), url=a["url"],
-                        action="carried"))
+                        "webhook_prod_manual",
+                        f"WEBHOOK '{name}' MUST BE CREATED MANUALLY ON THE DESTINATION "
+                        f"CLIENT — its production receiver is not carried. Type a "
+                        f"'Webhook receiver URL for the clone' and capture again to have "
+                        f"it created.",
+                        kind="webhook_workflow", object_id=wf.get("id"),
+                        events={s: len(n) for c in body["conditions"] if c.get("type") == "event"
+                                for s, n in (c.get("events") or {}).items()},
+                        action="not_created"))
+                    continue
+                for a in hooks:
+                    src_url = a.get("url")
+                    a["url"] = receiver
+                    a.pop("headers", None); a.pop("signature", None)
+                    flag(make_flag(
+                        "webhook_receiver_substituted",
+                        f"webhook workflow '{name}' will still be created, but delivers "
+                        f"to {receiver} instead of the source's production receiver; its "
+                        f"headers and signing key are not carried",
+                        kind="webhook_workflow", object_id=wf.get("id"), url=receiver,
+                        action="substituted"))
+                    notes.append(f"receiver replaced ({src_url and 'production URL' or 'none'} "
+                                 f"-> {receiver}); headers and signature dropped")
+            else:
+                for a in body["actions"]:
+                    if a.get("type") == "webhook" and a.get("url"):
+                        flag(make_flag(
+                            "webhook_url_carried",
+                            f"webhook workflow '{name}' will deliver to {a['url']} — the "
+                            f"source's receiver, carried as-is with its headers and signing "
+                            f"key. Confirm that is the intended endpoint for the clone.",
+                            kind="webhook_workflow", object_id=wf.get("id"), url=a["url"],
+                            action="carried"))
             # No retry: 5 x 20s on condition_entity_entity_id_invalid changed nothing (run
             # 2026-09-08T15:48Z), so it is not propagation — it was the secret key's entity
             # assignment (see WEBHOOK_SECRET_KEY_SCOPES).
@@ -2385,6 +2836,52 @@ def build_plan(cap, target_client_name=None):
                 verify={"compare": "workflows", "expected": expected})
 
     _webhook_steps()
+
+    # Lists whose pages could not all be read (see Reader.hal_all) — any mode. A plan built
+    # from a truncated list would silently be a plan for fewer objects.
+    for t in (cap.get("_meta") or {}).get("truncated") or []:
+        flag(make_flag(
+            "list_truncated",
+            f"only {t['read']} of {t['total']} items could be read from {t['path']} — the "
+            f"plan is missing the rest; capture again before applying",
+            kind="capture", path=t["path"], read=t["read"], total=t["total"],
+            action="not_checked"))
+
+    if prod:
+        # One-line summaries of what Prod -> Sandbox left out or carried on purpose.
+        if prod_processor_scrubs:
+            flag(make_flag(
+                "prod_processor_fields_dropped",
+                f"{len(prod_processor_scrubs)} processor(s) will still be created, but "
+                f"their production authorization keys and card acceptor ids are not "
+                f"carried — sandbox assigns its own: "
+                + ", ".join(sorted({n for n, _ in prod_processor_scrubs})),
+                kind="processor", processors=prod_processor_scrubs, action="dropped"))
+        bins = sorted({str((p.get("detail") or {}).get("acquiring_bin"))
+                       for e in cap["entities"] for p in e.get("processing_profiles", [])
+                       if (p.get("detail") or {}).get("acquiring_bin")})
+        if bins:
+            flag(make_flag(
+                "prod_bin_carried",
+                f"production acquiring BIN(s) {', '.join(bins)} are carried on the "
+                f"profiles as-is — sandbox BIN ranges may differ; verify with the acquirer "
+                f"team if a create is refused",
+                kind="processing_profile", bins=bins, action="carried"))
+        contacts = []
+        if (cap.get("client") or {}).get("email"):
+            contacts.append("client.email")
+        for e in cap["entities"]:
+            for p in e.get("processing_profiles", []):
+                d = p.get("detail") or {}
+                for f in ("card_acceptor_email", "card_acceptor_phone"):
+                    if d.get(f) and f"processing_profile.{f}" not in contacts:
+                        contacts.append(f"processing_profile.{f}")
+        if contacts:
+            flag(make_flag(
+                "prod_contact_details_carried",
+                "production contact details are carried into sandbox as-is (decision "
+                "2026-09-09): " + ", ".join(contacts),
+                kind="capture", fields=contacts, action="carried"))
 
     # not attempted in this pass — recorded explicitly rather than silently omitted
     for k, why in (("pay_to_card_entity", "GET /pay-to-card-entity returns 503"),
@@ -2421,7 +2918,10 @@ def build_plan(cap, target_client_name=None):
         "webhooks_source": cap.get("workflows_source"),
         "webhooks_read": len(cap["workflows"]) if isinstance(cap.get("workflows"), list) else None,
         "source": {"client_id": src_cli, "client_name": client.get("name"),
-                   "entities": [e["id"] for e in cap["entities"]]},
+                   "entities": [e["id"] for e in cap["entities"]],
+                   # "sandbox" or "prod" — where the source was read from. clone_apply
+                   # redacts the journal for a prod source; writes go to sandbox either way.
+                   "env": cap.get("source_env") or "sandbox"},
         "target": {"client_name": target_client_name, "mode": "new_client"},
         "counts": _counts(steps),
         "steps": steps,

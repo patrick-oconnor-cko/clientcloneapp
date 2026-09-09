@@ -44,7 +44,8 @@ capp.clone_keys.generate = lambda bits=2048: _TEST_KEYPAIR
 KIND_ORDER = ["client", "client_risk_settings", "client_flow_account",
               "client_compass_settings", "client_compass_check", "vault_lookup", "entity",
               "currency_account",
-              "processing_profile", "entity_service", "processing_channel", "processor",
+              "processing_profile", "entity_service", "prism_service_check",
+              "processing_channel", "processor",
               "sessions_channel", "sessions_profile_processor",
               "payment_routing_rule", "payout_routing_rule", "payout_setting",
               "payout_route_check", "client_public_crypto_key", "client_api_secret_key",
@@ -57,7 +58,8 @@ EXPECTED_COUNTS = {
     "client": 1, "client_risk_settings": 1, "client_flow_account": 1,
     "client_compass_settings": 1, "client_compass_check": 1, "vault_lookup": 1,
     "entity": 1, "currency_account": 2,
-    "processing_profile": 6, "entity_service": 1, "processing_channel": 1,
+    "processing_profile": 6, "entity_service": 1, "prism_service_check": 1,
+    "processing_channel": 1,
     "processor": 4,
     "sessions_channel": 1, "sessions_profile_processor": 4,
     "payment_routing_rule": 2, "payout_routing_rule": 1, "payout_setting": 1,
@@ -65,11 +67,11 @@ EXPECTED_COUNTS = {
     # the destination's API keys, minted in the run (2026-09-08)
     "client_public_crypto_key": 1, "client_api_secret_key": 1, "client_api_public_key": 1,
 }
-EXPECTED_STEPS = 34
+EXPECTED_STEPS = 35
 # Steps nothing downstream depends on: a live failure (or a missing key) is a flag and the
 # run continues. Everything else must be non-optional.
 OPTIONAL_KINDS = {"client_public_crypto_key", "client_api_secret_key", "client_api_public_key",
-                  "webhook_workflow", "webhook_check"}
+                  "webhook_workflow", "webhook_check", "prism_service_check"}
 # Steps whose CREATE body legitimately carries entity_id (the known-good token create names
 # an entity); everywhere else entity_id is a server-assigned echo that must be stripped.
 ENTITY_ID_IS_A_REQUEST_FIELD = {"client_api_secret_key", "client_api_public_key"}
@@ -1328,7 +1330,9 @@ class TestPayoutRouteParity(unittest.TestCase):
         self.assertEqual(run["counts"]["failed"], 0, run["problems"])
         # this fake returns a bare id for the API-key creates, so their secrets cannot be
         # recovered — that path has its own tests (TestDestinationApiKeys); ignore it here
-        codes = sorted(f["code"] for f in run["flags"] if not f["code"].startswith("api_key"))
+        # likewise the prism read-back gets a bare id from this fake (optional_lookup_empty)
+        codes = sorted(f["code"] for f in run["flags"]
+                       if not f["code"].startswith("api_key") and f["code"] != "optional_lookup_empty")
         self.assertEqual(codes, ["display_currency_differs",
                                  "payout_route_missing_on_clone",
                                  "payout_route_schemes_differ"])
@@ -1341,7 +1345,7 @@ class TestPayoutRouteParity(unittest.TestCase):
                      "conversion_currencies_differ": "client_compass_check"}
         seq_of = {x["kind"]: x["seq"] for x in run["journal"]}
         for f in run["flags"]:
-            if f["code"].startswith("api_key"):
+            if f["code"].startswith("api_key") or f["code"] == "optional_lookup_empty":
                 continue
             kind = next(v for k, v in raised_by.items() if f["code"].startswith(k))
             self.assertEqual(f["seq"], seq_of[kind], f["code"])
@@ -2181,6 +2185,9 @@ class TestWebhooks(unittest.TestCase):
                 return ({}, 200) if "clients" in path or "entities" in path else ({}, 404)
             def hal(self, path, key):
                 return [], 200
+            truncated = []
+            def hal_all(self, path, key, **kw):
+                return [], 200
         with mock.patch.object(cc, "Reader", FakeReader):
             cap = cc.capture("https://cat", "cat-tok", fx.SOURCE_CLIENT)
             self.assertEqual((cap["workflows"], cap["workflows_source"]), (None, "no_key"))
@@ -2203,7 +2210,7 @@ class TestWebhooks(unittest.TestCase):
     # -- plan side ---------------------------------------------------------------
     def test_create_body_strips_every_server_id_and_remaps_scope_ids(self):
         wf = self.cap["workflows"][0]
-        body, req, notes, emptied, dropped_events = cc.workflow_create_body(
+        body, req, notes, emptied, dropped_events, _unsupported = cc.workflow_create_body(
             wf, {self.eid}, {self.pcid}, self.cap["workflow_event_types"])
         self.assertEqual(dropped_events, [])
         blob = json.dumps(body)
@@ -2214,7 +2221,7 @@ class TestWebhooks(unittest.TestCase):
         for c in body["conditions"]:
             self.assertTrue(set(c) <= cc.WORKFLOW_CONDITION_FIELDS, c)
         for a in body["actions"]:
-            self.assertTrue(set(a) <= cc.WORKFLOW_ACTION_FIELDS, a)
+            self.assertTrue(set(a) <= cc.WORKFLOW_ACTION_FIELDS[a["type"]], a)
         self.assertEqual(body["name"], "Payments webhook")
         ents = next(c for c in body["conditions"] if c["type"] == "entity")
         pcs = next(c for c in body["conditions"] if c["type"] == "processing_channel")
@@ -2231,7 +2238,7 @@ class TestWebhooks(unittest.TestCase):
 
     def test_a_workflow_scoped_only_outside_the_capture_is_skipped_and_flagged(self):
         wf = self.cap["workflows"][1]
-        body, req, notes, emptied, _ = cc.workflow_create_body(wf, {self.eid}, {self.pcid})
+        body, req, notes, emptied, _, _ = cc.workflow_create_body(wf, {self.eid}, {self.pcid})
         self.assertEqual(emptied, "entity")
         hooks = steps_of(self.plan, "webhook_workflow")
         self.assertEqual([s["label"] for s in hooks], ["Payments webhook"])
@@ -2322,6 +2329,8 @@ class TestWebhooks(unittest.TestCase):
                 if path == "/workflows/event-types": return [{"id": "gateway", "events": [{"id": "payment_approved"}]}], 200
                 return ({}, 200) if "clients" in path or "entities" in path else ({}, 404)
             def hal(self, path, key): return [], 200
+            truncated = []
+            def hal_all(self, path, key, **kw): return [], 200
         with mock.patch.object(cc, "Reader", FakeReader):
             cap = cc.capture("https://cat", "cat-tok", fx.SOURCE_CLIENT, sandbox_secret_key=self.SRC_SK)
         self.assertEqual(cap["workflow_event_types"], {"gateway": ["payment_approved"]})
@@ -2682,6 +2691,477 @@ class TestDestinationApiKeys(unittest.TestCase):
         self.assertEqual([s for s in state["sent"] if s[3] == "/workflows"], [])
         self.assertEqual(run["destination_keys"], {})
         self.assertEqual(run["counts"]["failed"], 2)                 # only the two webhook steps
+
+
+class TestAwsActions(unittest.TestCase):
+    """Workflow actions are allowlisted PER TYPE. An aws (EventBridge) action needs
+    account_id + region — sent as {"type": "aws"} it fails with region_required (prod run
+    2026-09-09T15:17Z). In prod mode it targets production AWS, so the workflow is manual;
+    an unknown action type is never sent hollow either."""
+
+    def _plan(self, prod=False, mutate=None):
+        cap = fx.aws_workflow_capture()
+        if prod:
+            cap["source_env"] = "prod"
+            cap["webhook_receiver_url"] = "https://hooks.sandbox.example/in"
+        if mutate:
+            mutate(cap)
+        return plan_for(cap)
+
+    def _aws_step(self, plan):
+        return next((s for s in steps_of(plan, "webhook_workflow")
+                     if s["label"] == "EventBridge Notifications"), None)
+
+    def test_sandbox_carries_account_and_region_and_nothing_else(self):
+        step = self._aws_step(self._plan())
+        self.assertIsNotNone(step)
+        self.assertEqual(step["body"]["actions"],
+                         [{"type": "aws", "account_id": "123456789012", "region": "eu-west-1"},
+                          {"type": "aws", "account_id": "123456789012", "region": "eu-west-2"}])
+        # the webhook workflow in the same capture is unaffected
+        self.assertTrue(any(s["label"] == "Payments webhook"
+                            for s in steps_of(self._plan(), "webhook_workflow")))
+
+    def test_prod_makes_an_aws_workflow_a_manual_step(self):
+        plan = self._plan(prod=True)
+        self.assertIsNone(self._aws_step(plan))
+        f = next(x for x in plan["flags"] if x["code"] == "webhook_aws_manual")
+        self.assertIn("EventBridge Notifications", f["message"])
+        self.assertEqual(sorted(a["region"] for a in f["actions"]), ["eu-west-1", "eu-west-2"])
+        self.assertEqual(f["action"], "not_created")
+        # the plain webhook workflow is still created, re-pointed at the receiver
+        hook = next(s for s in steps_of(plan, "webhook_workflow") if s["label"] == "Payments webhook")
+        self.assertEqual(hook["body"]["actions"][0]["url"], "https://hooks.sandbox.example/in")
+
+    def test_an_unknown_action_type_skips_the_workflow_rather_than_sending_it_hollow(self):
+        def mutate(cap):
+            wf = next(w for w in cap["workflows"] if w["name"] == "EventBridge Notifications")
+            wf["actions"][0]["type"] = "sns"
+        plan = self._plan(mutate=mutate)
+        self.assertIsNone(self._aws_step(plan))
+        f = next(x for x in plan["flags"] if x["code"] == "webhook_action_unsupported")
+        self.assertEqual(f["action_types"], ["sns"])
+        self.assertNotIn('{"type": "sns"}', json.dumps(plan["steps"]))
+
+
+class TestLegacyPrismKey(unittest.TestCase):
+    """A channel whose prism service key is a legacy opaque id (not client|entity) must
+    never reach the clone unchanged — prod run 2026-09-09T13:40Z, step 43,
+    invalid_prism_merchant_service. The clone's real key is read back and asserted first."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cap = fx.legacy_prism_key_capture()
+        cls.plan = plan_for(cls.cap)
+        cls.eid = cls.cap["entities"][0]["id"]
+        cls.token = cc.prism_key_token(cls.eid)
+        cls.channel = steps_of(cls.plan, "processing_channel")[0]
+        cls.check = steps_of(cls.plan, "prism_service_check")[0]
+
+    def _prism(self, step):
+        return next(s for s in step["body"]["services"] if s["type"] == "prism")
+
+    def test_the_clone_prism_key_is_read_back_and_asserted_before_any_channel(self):
+        seqs = [s["seq"] for s in self.plan["steps"]]
+        es = steps_of(self.plan, "entity_service")[0]
+        self.assertLess(es["seq"], self.check["seq"])
+        self.assertLess(self.check["seq"], self.channel["seq"])
+        self.assertEqual(self.check["method"], "GET")
+        self.assertEqual(self.check["path"], f"/entities/{{{{{self.eid}}}}}/services")
+        self.assertEqual(self.check["provides"], self.token)
+        self.assertEqual(self.check["provides_from"], "prism.prism_key")
+        self.assertEqual(self.check["verify"]["compare"], "prism_service")
+        self.assertEqual(self.check["verify"]["expected"],
+                         {"client": f"{{{{{fx.SOURCE_CLIENT}}}}}", "entity": f"{{{{{self.eid}}}}}"})
+        # the same step exists on the plain reference plan too (any prism-using entity)
+        self.assertEqual(len(steps_of(plan_for(fx.reference_capture()), "prism_service_check")), 1)
+
+    def test_a_legacy_key_is_replaced_by_the_clones_own_key_never_carried(self):
+        prism = self._prism(self.channel)
+        self.assertEqual(prism["key"], f"{{{{{self.token}}}}}")
+        self.assertNotIn(fx.LEGACY_PRISM_KEY, json.dumps(self.plan["steps"]))
+        self.assertIn(self.token, self.channel["requires"])
+        self.assertEqual(cc.validate_plan(self.plan), [p for p in cc.validate_plan(self.plan)
+                                                     if p.startswith("warning:")])
+        # vault and pay-to-bank remapping are untouched
+        vault = next(s for s in self.channel["body"]["services"] if s["type"] == "vault")
+        self.assertEqual(vault["key"], f"{{{{{fx.SOURCE_VAULT}}}}}")
+
+    def test_the_warning_names_channel_original_key_and_replacement(self):
+        f = next(x for x in self.plan["flags"] if x["code"] == "prism_key_normalised")
+        self.assertEqual(f["object_id"], self.cap["entities"][0]["processing_channels"][0]["id"])
+        self.assertEqual(f["original_key"], fx.LEGACY_PRISM_KEY)
+        self.assertIn(self.token, f["replacement"])
+        self.assertEqual(f["action"], "substituted")
+        self.assertIn(fx.LEGACY_PRISM_KEY, f["message"])
+        # a composite key raises no such flag and is remapped as before
+        ref = plan_for(fx.reference_capture())
+        self.assertFalse(any(x["code"] == "prism_key_normalised" for x in ref["flags"]))
+        self.assertEqual(self._prism(steps_of(ref, "processing_channel")[0])["key"],
+                         f"{{{{{fx.SOURCE_CLIENT}}}}}|{{{{{self.eid}}}}}")
+
+    def test_dry_run_resolves_the_replacement_like_any_other_id(self):
+        with NoSocket():
+            run = capp.apply_plan(self.plan, dry_run=True)
+        self.assertEqual(run["counts"]["failed"], 0, run["problems"])
+        e = next(x for x in run["journal"] if x["seq"] == self.channel["seq"])
+        key = next(s for s in e["body"]["services"] if s["type"] == "prism")["key"]
+        self.assertEqual(key, run["id_map"][self.token])
+        self.assertNotIn("{{", key)
+
+    def _live(self, services_response):
+        sent = {}
+        def fake_send(base, token, method, path, body=None, timeout=30):
+            if path.endswith("/services") and method == "GET":
+                return services_response, 200, None
+            if method == "GET":
+                return {"id": fx._id("vact", "clonevault"), "data": []}, 200, None
+            if "/processing-channels" in path and method == "POST" and "processors" not in path:
+                sent["channel_prism_key"] = next(s for s in body["services"] if s["type"] == "prism")["key"]
+            return {"id": fx._id("new", path.rsplit("/", 1)[-1][:8])}, 201, None
+        with mock.patch.object(capp, "_send", side_effect=fake_send), \
+             mock.patch("time.sleep", lambda *a, **k: None):
+            run = capp.apply_plan(self.plan, base="https://x", token="t", dry_run=False,
+                                  pace_seconds=0)
+        return run, sent
+
+    def test_live_channel_is_sent_with_exactly_the_key_cat_minted_for_the_clone(self):
+        run, sent = self._live({"prism": {"is_enabled": True,
+                                          "prism_key": "cli_CLONE|ent_CLONE"}})
+        self.assertEqual(sent["channel_prism_key"], "cli_CLONE|ent_CLONE")
+        chk = next(x for x in run["journal"] if x["kind"] == "prism_service_check")
+        self.assertEqual(chk["verify"]["prism_key"], "cli_CLONE|ent_CLONE")
+        self.assertTrue(chk["verify"]["enabled"])
+        self.assertNotIn(fx.LEGACY_PRISM_KEY, json.dumps(run["journal"]))
+
+    def test_a_disabled_or_mismatched_prism_service_is_flagged(self):
+        run, _ = self._live({"prism": {"is_enabled": False, "prism_key": "cli_A|ent_B"}})
+        codes = {f["code"] for f in run["flags"]}
+        self.assertIn("prism_service_not_enabled", codes)
+        self.assertIn("prism_key_unexpected", codes)   # the run's ids are not cli_A|ent_B
+
+    def test_no_prism_key_on_the_clone_blocks_the_channel_rather_than_sending_a_guess(self):
+        run, sent = self._live({"prism": {"is_enabled": True}})     # no prism_key
+        self.assertNotIn("channel_prism_key", sent)
+        self.assertGreater(run["counts"]["failed"], 0)
+        self.assertNotIn(fx.LEGACY_PRISM_KEY, json.dumps(run["journal"]))
+
+
+class TestProdMode(unittest.TestCase):
+    """Prod -> Sandbox: the source is read from production CAT, every write still goes to
+    sandbox, and nothing production-only reaches sandbox or disk (PROD_* tables)."""
+
+    PROD_TOKEN = "prod-cat-token-xyz"
+    SBX_TOKEN = "sandbox-cat-token-abc"
+    PROD_SK = "sk_" + "p" * 30
+    RECEIVER = "https://hooks.sandbox.example/in"
+    SECRETS = (fx.PROD_IBAN, fx.PROD_ACCOUNT_NUMBER, fx.PROD_MID, fx.PROD_TOKEN,
+               fx.PROD_PASSWORD, fx.PROD_AUTH_KEY, fx.PROD_SEN, fx.PROD_WEBHOOK_URL,
+               fx.PROD_WEBHOOK_AUTH, fx.PROD_SIRET)
+
+    def _payload(self, **extra):
+        p = {"client_id": fx.SOURCE_CLIENT, "cat_token": self.SBX_TOKEN,
+             "src_cat_token": self.PROD_TOKEN, "source_env": "prod",
+             "src_prod_sk": self.PROD_SK, "webhook_receiver_url": self.RECEIVER}
+        p.update(extra)
+        return p
+
+    # ---- routing --------------------------------------------------------------
+    def test_capture_reads_the_source_from_prod_and_the_target_lists_from_sandbox(self):
+        with mock.patch.object(server.cc, "capture", return_value=fx.prod_capture()) as c, \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()), NoSocket():
+            out = server.clone_capture_handler(self._payload())
+        args, kw = c.call_args
+        self.assertEqual(args[0], server.CAT_BASES["prod"])
+        self.assertEqual(args[1], self.PROD_TOKEN)
+        self.assertEqual(kw["source_env"], "prod")
+        self.assertEqual(kw["target_base"], server.TARGET_CAT_BASE)
+        self.assertEqual(kw["target_token"], self.SBX_TOKEN)
+        self.assertEqual(kw["sandbox_api_base"], server.API_BASES["prod"])
+        self.assertEqual(kw["sandbox_secret_key"], self.PROD_SK)
+        self.assertEqual(out.get("source_env"), "prod")
+
+    def test_sandbox_mode_routing_is_unchanged(self):
+        with mock.patch.object(server.cc, "capture", return_value=fx.reference_capture()) as c, \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()), NoSocket():
+            server.clone_capture_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t",
+                                          "sandbox_sk": "sk_sbox_" + "s" * 26})
+        args, kw = c.call_args
+        self.assertEqual(args[0], server.CAT_BASES["sandbox"])
+        self.assertEqual(args[1], "t")
+        self.assertEqual(kw["source_env"], "sandbox")
+        self.assertIsNone(kw["target_base"])
+        self.assertEqual(kw["sandbox_api_base"], server.API_BASES["sandbox"])
+        self.assertEqual(kw["sandbox_secret_key"], "sk_sbox_" + "s" * 26)
+
+    def test_prod_mode_needs_both_tokens(self):
+        with mock.patch.object(server.cc, "capture") as c, NoSocket():
+            out = server.clone_capture_handler(self._payload(src_cat_token=""))
+        self.assertIn("Source CAT token", out["error"])
+        c.assert_not_called()
+
+    def test_prod_key_is_refused_outside_prod_mode_and_if_sandbox_shaped(self):
+        with mock.patch.object(server.cc, "capture") as c, NoSocket():
+            out = server.clone_capture_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t",
+                                                "src_prod_sk": self.PROD_SK})
+            self.assertIn("only accepted in Prod", out["error"])
+            out = server.clone_capture_handler(self._payload(src_prod_sk="sk_sbox_" + "x" * 26))
+            self.assertIn("production sk_", out["error"])
+        c.assert_not_called()
+
+    def test_writes_always_go_to_sandbox_with_the_sandbox_token(self):
+        plan = plan_for(fx.prod_capture(self.RECEIVER))
+        with mock.patch.object(server.capp, "apply_plan", return_value={"journal": []}) as a, \
+             mock.patch.object(server.capp, "render_run", return_value=""), \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()), NoSocket():
+            server.clone_apply_handler(self._payload(plan=plan, dry_run=False, confirm="CLONE"))
+        kw = a.call_args.kwargs
+        self.assertEqual(kw["base"], server.TARGET_CAT_BASE)
+        self.assertEqual(kw["token"], self.SBX_TOKEN)             # never the prod token
+        self.assertNotIn("source_sandbox_secret", kw["sandbox_keys"])
+        self.assertNotIn(self.PROD_SK, json.dumps(kw["sandbox_keys"]))
+        self.assertIs(kw["redact"], cc.redact_for_disk)         # prod source -> redacted journal
+        with mock.patch.object(server.ccl, "verify", return_value={"rows": []}) as v, NoSocket():
+            server.clone_verify_handler(self._payload(created_objects=[{"kind": "client", "new_id": "x"}]))
+        self.assertEqual(v.call_args.args[1], server.TARGET_CAT_BASE)
+        self.assertEqual(v.call_args.args[2], self.SBX_TOKEN)
+
+    def test_entities_handler_reads_from_the_source_environment(self):
+        made = []
+        class R:
+            def __init__(self, base, token): made.append((base, token))
+            def hal_all(self, path, key, **kw): return [{"id": fx.SOURCE_CLIENT}], 200
+        with mock.patch.object(server.cc, "Reader", R):
+            server.clone_entities_handler(self._payload())
+            server.clone_entities_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t"})
+        self.assertEqual(made, [(server.CAT_BASES["prod"], self.PROD_TOKEN),
+                                (server.CAT_BASES["sandbox"], "t")])
+
+    # ---- scrub ----------------------------------------------------------------
+    def test_a_prod_plan_carries_no_production_secret(self):
+        plan = plan_for(fx.prod_capture(self.RECEIVER))
+        blob = json.dumps(plan)
+        for v in self.SECRETS:
+            self.assertNotIn(v, blob, v)
+        self.assertNotIn(fx.PROD_CAID, json.dumps([s["body"] for s in plan["steps"]]))
+        self.assertEqual(plan["source"]["env"], "prod")
+        codes = {f["code"] for f in plan["flags"]}
+        for c in ("prod_credentials_stripped", "prod_caid_regenerated",
+                  "prod_processor_fields_dropped", "prod_bank_details_not_carried",
+                  "prod_bin_carried", "prod_contact_details_carried",
+                  "webhook_receiver_substituted", "network_tokens_not_captured"):
+            self.assertIn(c, codes)
+        # the same client read from sandbox is untouched by any of this
+        sbx = plan_for(fx.reference_capture())
+        self.assertEqual(sbx["source"]["env"], "sandbox")
+        self.assertFalse(any(f["code"].startswith("prod_") for f in sbx["flags"]))
+        self.assertTrue(all(not s["needs_manual"] for s in sbx["steps"]))
+
+    def test_payout_setting_blocks_until_a_sandbox_test_account_is_supplied(self):
+        plan = plan_for(fx.prod_capture(self.RECEIVER))
+        ps = steps_of(plan, "payout_setting")[0]
+        self.assertEqual(ps["needs_manual"], ["payment_instrument.bank_details",
+                                              "payment_instrument.account_holder_details"])
+        self.assertNotIn("bank_details", ps["body"].get("payment_instrument", {}))
+        with NoSocket():
+            run = capp.apply_plan(plan, dry_run=True)
+        e = next(x for x in run["journal"] if x["seq"] == ps["seq"])
+        self.assertEqual(e["status"], "blocked")
+        self.assertIn("payment_instrument.bank_details", e["error"])
+        self.assertIn("manual_value_required", {f["code"] for f in run["flags"]})
+        self.assertGreater(run["counts"]["failed"], 0)      # a hard stop, not optional
+        test_account = {"bank_name": "Sandbox Bank", "account_number": "00000000",
+                        "bank_code": "000000"}
+        with NoSocket():
+            run = capp.apply_plan(plan, dry_run=True, manual_values={
+                f"{ps['seq']}.payment_instrument.bank_details": test_account,
+                f"{ps['seq']}.payment_instrument.account_holder_details": {"company_name": "Test"}})
+        e = next(x for x in run["journal"] if x["seq"] == ps["seq"])
+        self.assertEqual(e["status"], "dry-run")
+        self.assertEqual(e["body"]["payment_instrument"]["bank_details"], test_account)
+        self.assertEqual(run["counts"]["failed"], 0)
+
+    def test_a_required_siret_becomes_the_sandbox_placeholder_and_is_flagged(self):
+        # Learned live (prod run 2026-09-09T12:47Z): stripping the SIRET from a Cartes
+        # Bancaires profile fails the create with siret_required. Patrick's decision: send a
+        # well-formed placeholder and say so in the report.
+        plan = plan_for(fx.prod_capture(self.RECEIVER))
+        prof = next(s for s in steps_of(plan, "processing_profile")
+                    if "siret" in (s["body"].get("custom_settings") or {}))
+        self.assertEqual(prof["body"]["custom_settings"]["siret"], cc.SANDBOX_SIRET_PLACEHOLDER)
+        self.assertNotIn(fx.PROD_SIRET, json.dumps(plan))
+        f = next(x for x in plan["flags"] if x["code"] == "prod_siret_placeholder")
+        self.assertEqual(f["action"], "substituted")
+        self.assertIn(cc.SANDBOX_SIRET_PLACEHOLDER, f["message"])
+        self.assertIn("still be created", f["message"])
+        # sandbox -> sandbox carries the source's SIRET untouched, as before
+        cap = fx.reference_capture()
+        cs = dict(cap["entities"][0]["processing_profiles"][0]["detail"].get("custom_settings") or {})
+        cs["siret"] = "99988877766655"
+        cap["entities"][0]["processing_profiles"][0]["detail"]["custom_settings"] = cs
+        sbx = plan_for(cap)
+        self.assertIn("99988877766655", json.dumps(sbx))
+        self.assertFalse(any(x["code"] == "prod_siret_placeholder" for x in sbx["flags"]))
+
+    def test_amex_rows_get_sandboxs_own_se_number_per_currency(self):
+        # Learned live (prod run 2026-09-09T13:03Z): an SE_CCY row without its service
+        # establishment number is refused (custom_settings_se_ccy_0_invalid). Sandbox has
+        # its OWN SE numbers per currency (merchant_size oversized); a currency with none
+        # cannot be processed on Amex in sandbox and is left out — never the prod number.
+        plan = plan_for(fx.prod_capture(self.RECEIVER))
+        prof = next(s for s in steps_of(plan, "processing_profile")
+                    if (s["body"].get("custom_settings") or {}).get("SE_CCY"))
+        cs = prof["body"]["custom_settings"]
+        self.assertEqual(cs["SE_CCY"], [{"currency": "GBP", "processing_threshold": "100",
+                                         "service_establishment_number": cc.AMEX_SANDBOX_SEN["GBP"]}])
+        self.assertEqual(cs["merchant_size"], "oversized")
+        self.assertNotIn("SLE", prof["body"]["currencies"])
+        self.assertIn("GBP", prof["body"]["currencies"])
+        self.assertNotIn(fx.PROD_SEN, json.dumps(plan))
+        codes = {x["code"]: x for x in plan["flags"]}
+        self.assertEqual(codes["prod_sen_sandbox_oversized"]["currencies"], ["GBP"])
+        self.assertEqual(codes["prod_sen_currency_unavailable"]["currencies"], ["SLE"])
+        for c in ("prod_sen_sandbox_oversized", "prod_sen_currency_unavailable"):
+            self.assertIn("still be created", codes[c]["message"])
+        # the table is the CAT form's oversized option list: 10-digit numbers, one per currency
+        self.assertTrue(all(re.fullmatch(r"\d{10}", v) for v in cc.AMEX_SANDBOX_SEN.values()))
+        self.assertEqual(len(set(cc.AMEX_SANDBOX_SEN.values())), len(cc.AMEX_SANDBOX_SEN))
+        # sandbox -> sandbox keeps the source's SE numbers
+        cap = fx.reference_capture()
+        d = cap["entities"][0]["processing_profiles"][0]["detail"]
+        d["custom_settings"] = dict(d.get("custom_settings") or {},
+                                    SE_CCY=[{"currency": "GBP", "processing_threshold": 1,
+                                             "service_establishment_number": "5556667778"}])
+        self.assertIn("5556667778", json.dumps(plan_for(cap)))
+
+    def test_webhooks_are_repointed_at_the_receiver_or_skipped(self):
+        plan = plan_for(fx.prod_capture(self.RECEIVER))
+        hooks = steps_of(plan, "webhook_workflow")
+        self.assertTrue(hooks)
+        for s in hooks:
+            for a in s["body"]["actions"]:
+                self.assertEqual(a["url"], self.RECEIVER)
+                self.assertNotIn("headers", a)
+                self.assertNotIn("signature", a)
+        self.assertIn("webhook_receiver_substituted", {f["code"] for f in plan["flags"]})
+        plan2 = plan_for(fx.prod_capture(receiver_url=""))
+        self.assertEqual(steps_of(plan2, "webhook_workflow"), [])
+        self.assertIn("webhook_prod_manual", {f["code"] for f in plan2["flags"]})
+        self.assertNotIn(fx.PROD_WEBHOOK_URL, json.dumps(plan2))
+
+    def test_an_acquirer_missing_in_sandbox_skips_the_profile_and_its_processors(self):
+        cap = fx.prod_capture(self.RECEIVER)
+        prof = cap["entities"][0]["processing_profiles"][0]
+        acq = prof["detail"]["acquirer_key"]
+        cap["valid_currencies"]["acquirer_status"] = {acq: 404}
+        plan = plan_for(cap)
+        self.assertNotIn(prof["id"], [s["provides"] for s in plan["steps"]])
+        self.assertIn("acquirer_not_in_sandbox", {f["code"] for f in plan["flags"]})
+        before = len(steps_of(plan_for(fx.prod_capture(self.RECEIVER)), "processor"))
+        self.assertLess(len(steps_of(plan, "processor")), before)
+        self.assertEqual(cc.validate_plan(plan) and
+                         [p for p in cc.validate_plan(plan) if not p.startswith("warning:")], [])
+
+    # ---- disk -----------------------------------------------------------------
+    def test_a_prod_capture_is_redacted_on_disk_but_not_in_memory(self):
+        cap = fx.prod_capture(self.RECEIVER)
+        tmp = _tmp_runs_dir()
+        with mock.patch.object(server.cc, "capture", return_value=cap), \
+             mock.patch.object(server, "RUNS_DIR", tmp), NoSocket():
+            out = server.clone_capture_handler(self._payload())
+        saved = pathlib.Path(out["capture_path"]).read_text()
+        for v in self.SECRETS:
+            self.assertNotIn(v, saved, v)
+        self.assertIn("REDACTED(", saved)
+        self.assertIn(fx.PROD_IBAN, json.dumps(cap))     # the in-memory capture is intact
+        # a sandbox capture is written as-is
+        with mock.patch.object(server.cc, "capture", return_value=fx.reference_capture()), \
+             mock.patch.object(server, "RUNS_DIR", tmp), NoSocket():
+            out = server.clone_capture_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t"})
+        self.assertNotIn("REDACTED(", pathlib.Path(out["capture_path"]).read_text())
+
+    def test_a_prod_journal_is_redacted_on_disk_but_the_run_document_is_not(self):
+        plan = plan_for(fx.prod_capture(self.RECEIVER))
+        ps = steps_of(plan, "payout_setting")[0]
+        iban = "GB00TEST00000000000001"
+        manual = {f"{ps['seq']}.payment_instrument.bank_details": {"iban": iban},
+                  f"{ps['seq']}.payment_instrument.account_holder_details": {"company_name": "T"}}
+        jpath = _tmp_runs_dir() / "j.jsonl"
+        with NoSocket():
+            run = capp.apply_plan(plan, dry_run=True, manual_values=manual,
+                                  journal_path=str(jpath), redact=cc.redact_for_disk)
+        text = jpath.read_text()
+        self.assertNotIn(iban, text)
+        self.assertIn('"source_env": "prod"', text)
+        self.assertIn('"redacted": true', text)
+        self.assertIn(iban, json.dumps(run))   # the page still gets the real body
+
+    # ---- pagination (both modes) ---------------------------------------------
+    def test_hal_all_follows_total_count_and_records_truncation(self):
+        class Paged(cc.Reader):
+            def _fetch(self, path):
+                q = dict(p.split("=") for p in path.split("?", 1)[1].split("&"))
+                skip, limit = int(q["skip"]), int(q["limit"])
+                items = [{"id": f"x{i}"} for i in range(skip, min(skip + limit, 30))]
+                return {"limit": limit, "skip": skip, "total_count": 30,
+                        "_embedded": {"entities": items}}, 200
+        r = Paged("https://cat", "t")
+        items, code = r.hal_all("/clients/c/entities", "entities")
+        self.assertEqual(len(items), 30)
+        self.assertEqual(r.calls, 2)
+        self.assertEqual(r.truncated, [])
+
+        class Short(cc.Reader):
+            def _fetch(self, path):
+                return {"total_count": 40, "_embedded": {"entities": [{"id": "a"}] * 5}}, 200
+        r = Short("https://cat", "t")
+        items, _ = r.hal_all("/clients/c/entities", "entities")
+        self.assertEqual(len(items), 5)
+        self.assertEqual(r.truncated[0]["total"], 40)
+        cap = fx.reference_capture()
+        cap["_meta"]["truncated"] = r.truncated
+        self.assertIn("list_truncated", {f["code"] for f in plan_for(cap)["flags"]})
+
+
+class TestOktaConfig(unittest.TestCase):
+    """The page signs in to Okta itself (implicit flow); the server only serves the public
+    values it needs. Nothing here is a secret, and the two environments must not be mixed."""
+
+    SANDBOX_ISSUER = "https://checkout.oktapreview.com/oauth2/ausskuj3xaCB7FT2g0h7"
+    PROD_ISSUER = "https://checkout.okta.com/oauth2/aus14y376tJ9vBv7B357"
+
+    def test_config_carries_exactly_the_public_values(self):
+        c = server.okta_config()
+        self.assertEqual(sorted(c), ["envs", "redirect_uri", "scope"])
+        self.assertEqual(sorted(c["envs"]), ["prod", "sandbox"])
+        for env in c["envs"].values():
+            self.assertEqual(sorted(env), ["client_id", "issuer"])
+        self.assertEqual(c["envs"]["sandbox"]["issuer"], self.SANDBOX_ISSUER)
+        self.assertEqual(c["envs"]["prod"]["issuer"], self.PROD_ISSUER)
+        self.assertNotEqual(c["envs"]["sandbox"]["client_id"], c["envs"]["prod"]["client_id"])
+        self.assertEqual(c["scope"], "openid profile clientadmin-tool")
+        self.assertIsNone(re.search(r"secret|password", json.dumps(c), re.I))
+
+    def test_redirect_uri_follows_the_server_port(self):
+        self.assertEqual(server.okta_config()["redirect_uri"], f"http://localhost:{server.PORT}/")
+        self.assertEqual(server.okta_config(port=9000)["redirect_uri"], "http://localhost:9000/")
+
+    def test_the_page_uses_the_served_config_and_checks_the_return(self):
+        html = (pathlib.Path(server.HERE) / "clone.html").read_text()
+        self.assertIn("window.__OKTA__", html)
+        self.assertIn('response_type:"token"', html)
+        self.assertIn("/v1/authorize", html)
+        # the return must be checked against this tab's state and the token taken out of the bar
+        self.assertIn('p.get("state")!==saved.state', html)
+        self.assertIn("history.replaceState", html)
+        # and the token is never persisted by the page
+        self.assertNotIn("localStorage", html)
+
+    def test_page_injection_carries_the_config(self):
+        # _page() injects the config the same way it injects dev creds; check the tag shape
+        body = json.dumps(server.okta_config())
+        self.assertIn(self.SANDBOX_ISSUER, body)
+        self.assertNotIn("sk_sbox_", body)
 
 
 class TestCaptureProgress(unittest.TestCase):
@@ -3183,19 +3663,18 @@ class TestKnownGaps(unittest.TestCase):
     """Tests that pin CURRENT behaviour where it is known to be insufficient. Each one
     should FAIL when the corresponding TODO item is implemented — that is the point."""
 
-    def test_manual_values_supports_only_top_level_fields(self):
-        # TODO #2: apply splits the key on the FIRST dot and assigns body[field], so a
-        # nested path becomes a literal flat key. Nested support is a prerequisite for
-        # supplying custom_settings.credentials[].
+    def test_manual_values_resolve_nested_paths(self):
+        # Was a known gap (TODO #2): apply split the key on the FIRST dot and assigned
+        # body[field], so a nested path became a literal flat key. Nested support landed
+        # with Prod -> Sandbox (bank details are supplied as payment_instrument.bank_details).
         plan = plan_for(fx.reference_capture())
         prof = steps_of(plan, "processing_profile")[0]
         with NoSocket():
             run = capp.apply_plan(plan, dry_run=True, manual_values={
                 f"{prof['seq']}.custom_settings.credentials": "SENTINEL"})
         body = next(e["body"] for e in run["journal"] if e["seq"] == prof["seq"])
-        self.assertEqual(body["custom_settings.credentials"], "SENTINEL",
-                         "nested manual_values paths are now resolved — update this "
-                         "test and TODO.md item 2")
+        self.assertNotIn("custom_settings.credentials", body)
+        self.assertEqual(body["custom_settings"]["credentials"], "SENTINEL")
 
     def test_client_level_services_are_recorded_as_skipped_not_cloned(self):
         # A cloned client does not inherit IA, network tokens, RTAU, risk settings or

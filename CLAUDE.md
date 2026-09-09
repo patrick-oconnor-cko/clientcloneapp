@@ -18,14 +18,25 @@ that are expensive to rediscover.
   **source** key (`sandbox_sk`) only ever reads (webhooks at capture); the **destination**
   key (`dest_sandbox_sk`) is what `auth: "sandbox_secret"` steps are sent with. Without the
   destination key such a step is blocked (optional → flagged, run continues), never sent
-  with the CAT token or the source key. The CAT token is always pasted by Patrick; nothing
-  obtains one.
+  with the CAT token or the source key. **The CAT token comes from Okta SSO in the browser**
+  (OAuth 2.0 implicit flow against the same Okta apps the CAT UI uses; `server.OKTA` holds
+  the public issuer/client-id values, the page does the redirect and reads the fragment) or
+  is pasted — either way it lands in `cat_token`, is never persisted, and the server never
+  talks to Okta. Nothing else obtains one.
 - **The clone's API keys are minted in the run and never journalled.** CAT returns a key's
   secret RSA-encrypted with a public crypto key on the client; `clone_keys` (stdlib) makes
   the keypair at apply time, `clone_apply` decrypts, feeds the secret to the webhook steps
   and returns both plaintexts ONCE in `run["destination_keys"]`. Response excerpts redact
   `temporary_secret`/`secret`; the plan carries the literal `<<RUN_PUBLIC_KEY_PEM>>`
   marker, never key material. Keep it that way.
+- **Prod → Sandbox reads from production and writes to sandbox — never the other way.**
+  `server.CAT_BASES[source_env]` picks the read host; `TARGET_CAT_BASE` is the only write
+  host and apply/verify/cleanup never see the prod token. The prod token and the source
+  production secret key are read-only inputs accepted only in that mode. What leaves prod is
+  governed by the `PROD_*` tables in `clone_capture.py` (strip / blank / block-until-manual /
+  flag) — extend the table, do not special-case a body. A prod capture and a prod-source
+  journal are written through `redact_for_disk`; the in-memory copies are not. Sandbox →
+  Sandbox behaviour must stay byte-identical (a test pins the reference plan).
 - **Webhooks are Workflows in the Checkout sandbox API, not CAT.** `clean()` does not reach
   their nested ids; `workflow_create_body` strips `id`/`_links` at every level and remaps
   entity/channel conditions. A condition left empty by scoping means skip + flag, never a
@@ -73,6 +84,11 @@ into a clone, and never invent one. It stays in `DROP_ALWAYS` and is re-stamped 
 - **Profiles are created via `/entities/{id}/processing-profiles/v2`.** Send
   `checkout_legal_entity_codes` (plural array); the singular is a response-only echo, and
   `banking_partner_code` is server-derived — send neither.
+- **A channel's prism service key is usually `client|entity` — but not always.** A legacy
+  opaque id (32 hex) exists on real channels and can never be carried: `prism_service_check`
+  reads the clone's `prism.prism_key` back after the prism PUT and any non-composite source
+  key references that captured value (`prism_key_normalised`). Never pass a prism key
+  through unless it is the composite for the source client and entity.
 - **A sessions channel shares its gateway channel's id**, so it must not be registered in the
   id map (`provides=None`), or later references bind to the wrong object.
 - **Sessions-channel `services` exists only on the detail endpoint**, and spells the service

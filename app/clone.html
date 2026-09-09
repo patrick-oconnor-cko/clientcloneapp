@@ -89,10 +89,27 @@
   <div class="side">
     <label>Source Client ID (CLI to clone)</label>
     <input id="src_client" placeholder="cli_..." autocomplete="off"/>
-    <label>CAT API key (Bearer token)</label>
-    <input id="cat_token" placeholder="eyJ... (Okta bearer)" autocomplete="off"/>
-    <label>Source Sandbox Secret Key</label>
-    <input id="sbox_sk" type="password" placeholder="sk_sbox_... (reads the source's webhooks)" autocomplete="off"/>
+    <div class="prodonly" style="display:none">
+      <label>Source CAT token (PROD — read-only)</label>
+      <input id="src_cat_token" placeholder="eyJ... prod Okta bearer — reads the source only" autocomplete="off"/>
+      <button class="btn" id="okta_src" style="margin-top:4px">Sign in with Okta (prod CAT)</button>
+      <div class="hint" id="srctokstatus"></div>
+    </div>
+    <label id="cat_token_label">CAT API key (Bearer token)</label>
+    <input id="cat_token" placeholder="eyJ... (Okta bearer) — or use the button" autocomplete="off"/>
+    <button class="btn" id="okta" style="margin-top:4px">Sign in with Okta (sandbox CAT)</button>
+    <div class="hint" id="tokstatus"></div>
+    <div class="prodonly" style="display:none">
+      <label>Source production secret key (read-only, webhooks)</label>
+      <input id="src_prod_sk" type="password" placeholder="sk_... (production) — reads the source's webhooks" autocomplete="off"/>
+      <label>Webhook receiver URL for the clone</label>
+      <input id="webhook_receiver_url" placeholder="https://… — every cloned webhook is pointed here" autocomplete="off"/>
+      <div class="hint">Production receivers are never carried. Leave empty to skip webhooks (flagged as a manual step).</div>
+    </div>
+    <div class="sandboxonly">
+      <label>Source Sandbox Secret Key</label>
+      <input id="sbox_sk" type="password" placeholder="sk_sbox_... (reads the source's webhooks)" autocomplete="off"/>
+    </div>
     <label>Destination Sandbox Secret Key <span class="mut">(optional — minted in the run)</span></label>
     <input id="dest_sk" type="password" placeholder="sk_sbox_... only if the new client already has keys" autocomplete="off"/>
     <label>Sandbox Public Key</label>
@@ -113,6 +130,7 @@
   </div>
 
   <div class="main">
+    <div id="modebanner"></div>
     <div class="stages" id="stages"></div>
     <div id="view">
       <div class="banner">
@@ -148,6 +166,7 @@ let MODE="sandbox";
 function setMode(m){
   MODE=m;
   document.querySelectorAll("#mode button").forEach(b=>b.classList.toggle("on",b.dataset.mode===m));
+  if(typeof refreshModeUI==="function") refreshModeUI();   // prod-only fields, banner, token labels
 }
 document.querySelectorAll("#mode button").forEach(b=>{b.onclick=()=>setMode(b.dataset.mode);});
 
@@ -210,11 +229,21 @@ async function post(path,body){
 // mandatory; the sandbox keys are optional and matter only to steps that call the Checkout
 // sandbox API (the server refuses anything without the sk_sbox_/pk_sbox_ prefix).
 function creds(){
-  const c={cat_token:$("cat_token").value.trim()};
+  // cat_token is always the TARGET (sandbox) token — writes go there in every mode.
+  const c={cat_token:$("cat_token").value.trim(), source_env:MODE};
   const sk=$("sbox_sk").value.trim(), dk=$("dest_sk").value.trim(), pk=$("sbox_pk").value.trim();
   if(sk)c.sandbox_sk=sk;            // SOURCE client's key: reads its webhooks at capture
   if(dk)c.dest_sandbox_sk=dk;       // DESTINATION client's key: creates them at apply
   if(pk)c.sandbox_pk=pk;
+  if(MODE==="prod"){
+    // Prod → Sandbox: the source is read with a PROD CAT token (and, for webhooks, a
+    // production secret key); both are read-only on the server. The receiver URL is where
+    // every cloned webhook is pointed instead of the merchant's production endpoint.
+    const st=$("src_cat_token").value.trim(), pk2=$("src_prod_sk").value.trim(), ru=$("webhook_receiver_url").value.trim();
+    if(st)c.src_cat_token=st;
+    if(pk2)c.src_prod_sk=pk2;
+    if(ru)c.webhook_receiver_url=ru;
+  }
   return c;
 }
 
@@ -262,6 +291,26 @@ async function loadEntities(){
 // Every plan flag mirrors its message into warnings; a few plain warnings have no flag.
 // Match the two by message so structured flags get a label and a "still created" marker.
 const FLAG_LABELS={
+  // Prod → Sandbox scrub
+  prism_key_normalised:"Prism key — legacy id replaced by the clone's",
+  webhook_aws_manual:"Webhook — manual step (AWS EventBridge target)",
+  webhook_action_unsupported:"Webhook — manual step (unsupported action type)",
+  prism_service_not_enabled:"Prism service not enabled on the clone",
+  prism_key_unexpected:"Prism key — unexpected value",
+  prod_credentials_stripped:"Prod acquirer credentials — not carried",
+  prod_siret_placeholder:"SIRET — placeholder value",
+  prod_sen_sandbox_oversized:"Amex SE numbers — sandbox's own (oversized)",
+  prod_sen_currency_unavailable:"Amex currency — no sandbox SE number",
+  prod_caid_regenerated:"Prod card acceptor id — regenerated",
+  prod_processor_fields_dropped:"Prod processor keys/ids — not carried",
+  prod_bank_details_not_carried:"Prod bank details — supply a sandbox test account",
+  prod_bin_carried:"Prod BINs — carried, verify",
+  prod_contact_details_carried:"Prod contact details — carried",
+  acquirer_not_in_sandbox:"Acquirer not in sandbox",
+  webhook_receiver_substituted:"Webhook receiver — replaced",
+  webhook_prod_manual:"Webhook — manual step (prod receiver)",
+  manual_value_required:"Value required from you",
+  list_truncated:"List truncated",
   currency_not_available:"Currency not available",
   currency_validation_unavailable:"Currency check unavailable",
   routing_rule_scope_emptied:"Routing rule would match nothing",
@@ -403,6 +452,18 @@ async function capture(){
               new_client_name:$("new_name").value.trim()};
   if(!body.client_id||!body.cat_token){
     $("status").innerHTML='<span class="err">Source Client ID and token are required</span>'; return;}
+  if(MODE==="prod"){
+    // Prod → Sandbox needs both tokens, each from the right Okta app: the source is read
+    // with the prod one, the target's lists (and every write) use the sandbox one.
+    if(!body.src_cat_token){
+      $("status").innerHTML='<span class="err">Prod → Sandbox needs the Source CAT token (prod) as well</span>'; return;}
+    const se=tokenEnv(body.src_cat_token), te=tokenEnv(body.cat_token);
+    if(se&&se!=="prod"){ $("status").innerHTML='<span class="err">The Source CAT token is not a production token</span>'; return; }
+    if(te&&te!=="sandbox"){ $("status").innerHTML='<span class="err">The Target CAT token must be a sandbox token — a prod token would not be accepted for writes</span>'; return; }
+  }else{
+    const te=tokenEnv(body.cat_token);
+    if(te==="prod"){ $("status").innerHTML='<span class="err">This is a prod token but Sandbox → Sandbox is selected — switch the toggle or sign in to sandbox</span>'; return; }
+  }
   if(ENTITIES){
     // Send the ticked ids only when they are a real subset; every box ticked is "all",
     // which is what an unloaded list means too.
@@ -417,6 +478,8 @@ async function capture(){
   const seed=ENTITIES?SCOPE.length:null;      // the server's entity_total overrides this
   let lastP={entries:[],done:false};
   renderCaptureProgress(lastP,t0,seed);
+  // the Capture button sits below the entity list; the read-out renders at the top
+  window.scrollTo(0,0);
   const stop=pollProgress(runId,p=>{lastP=p; renderCaptureProgress(p,t0,seed);});
   try{
     const {code,body:j}=await post("/api/clone/capture",body);
@@ -457,7 +520,7 @@ function notImplemented(j,el){
 }
 
 // ---- human-readable review of everything the plan will create ----
-const KINDLABEL={entity:"Entity",currency_account:"Currency account",
+const KINDLABEL={entity:"Entity",currency_account:"Currency account",prism_service_check:"Prism key read-back",
   processing_profile:"Processing profile",processing_channel:"Processing channel",
   processor:"Processor",sessions_channel:"Sessions layer",
   payment_routing_rule:"Payment routing rule",payout_routing_rule:"Payout routing rule",
@@ -1105,8 +1168,105 @@ function dlPlan(){const b=new Blob([JSON.stringify(PLAN,null,2)],{type:"applicat
   a.download="clone-plan.json";a.click();}
 function copyPlan(){navigator.clipboard.writeText(JSON.stringify(PLAN,null,2));}
 
+// ---- Okta SSO for the CAT token ----
+// Same flow and Okta apps as the CAT UI and the CAT configuration helper: OAuth 2.0
+// implicit — send the browser to Okta's /v1/authorize with response_type=token, come back
+// to this page with the access token in the URL fragment. The server takes no part; the
+// bearer lands in the same cat_token field a pasted token uses. Unlike the reference app
+// we check state and nonce, strip the token from the address bar, and show expiry.
+function okta(){return window.__OKTA__||null;}
+const OKTA_SS="okta_login";   // sessionStorage: survives the redirect, dies with the tab
+let TOKEN_ENV=null;
+function randomHex(){const a=new Uint8Array(16);crypto.getRandomValues(a);return [...a].map(b=>b.toString(16).padStart(2,"0")).join("");}
+function jwtPayload(tok){
+  try{const p=tok.split(".")[1]; const pad=p.length%4?"=".repeat(4-p.length%4):"";
+      return JSON.parse(atob(p.replace(/-/g,"+").replace(/_/g,"/")+pad));}catch(e){return null;}
+}
+// Which token field an environment's token belongs in: the sandbox token is always the
+// TARGET (cat_token); in Prod → Sandbox the prod token is the read-only SOURCE token.
+function tokenFieldFor(env){return env==="prod"?"src_cat_token":"cat_token";}
+function startOktaLogin(env){
+  const cfg=okta();
+  env=env||"sandbox";
+  if(!cfg){$(env==="prod"?"srctokstatus":"tokstatus").innerHTML='<span class="err">Okta config not served — restart the server (python3 app/server.py)</span>';return;}
+  const app=cfg.envs[env];
+  const state=randomHex(), nonce=randomHex();
+  sessionStorage.setItem(OKTA_SS,JSON.stringify({state,nonce,env,started:Date.now()}));
+  const q=new URLSearchParams({client_id:app.client_id,response_type:"token",scope:cfg.scope,
+                               redirect_uri:cfg.redirect_uri,state,nonce});
+  location.assign(app.issuer+"/v1/authorize?"+q.toString());
+}
+function finishOktaLogin(){
+  const h=location.hash; if(!h||h.length<2) return false;
+  const p=new URLSearchParams(h.slice(1));
+  if(!p.has("access_token")&&!p.has("error")) return false;
+  // never leave a token in the address bar or the history
+  try{history.replaceState(null,"",location.pathname+location.search);}catch(e){}
+  const saved=JSON.parse(sessionStorage.getItem(OKTA_SS)||"null"); sessionStorage.removeItem(OKTA_SS);
+  if(p.has("error")){
+    $("tokstatus").innerHTML=`<span class="err">Okta: ${esc(p.get("error"))} — ${esc(p.get("error_description")||"")}</span>`;
+    return false;
+  }
+  if(!saved||p.get("state")!==saved.state){
+    $("tokstatus").innerHTML='<span class="err">login response did not match this tab — sign in again</span>'; return false;
+  }
+  const tok=p.get("access_token"), pl=jwtPayload(tok);
+  if(!pl||(pl.nonce&&pl.nonce!==saved.nonce)){
+    $("tokstatus").innerHTML='<span class="err">token could not be read or its nonce did not match — sign in again</span>'; return false;
+  }
+  $(tokenFieldFor(saved.env)).value=tok; TOKEN_ENV=saved.env;
+  if(saved.env==="prod") setMode("prod"); else tokenStatus();
+  $("status").innerHTML=`<span class="ok">Signed in via Okta (${esc(saved.env)}).</span> Load entities, then Capture.`;
+  return true;
+}
+// Who is signed in, for which environment, and for how long — from the token's own claims
+// (decoded for display only; CAT verifies the signature). Also re-labels the button per MODE
+// and warns when the token's Okta app does not match the selected source environment.
+// Which environment issued a token, from its Okta client id (display + guard only).
+function tokenEnv(tok){
+  const pl=jwtPayload(tok), cfg=okta(); if(!pl||!cfg) return null;
+  return pl.cid===cfg.envs.prod.client_id?"prod":pl.cid===cfg.envs.sandbox.client_id?"sandbox":null;
+}
+// One status line for one token field: who, which environment, expiry countdown, and a
+// warning when the token's environment is not the one that field is for.
+function tokenLine(fieldId,statusId,want){
+  const el=$(statusId); if(!el) return;
+  const tok=$(fieldId).value.trim();
+  if(!tok){el.innerHTML=`<span class="mut">No ${want} token. Sign in with Okta, or paste one.</span>`;return;}
+  const pl=jwtPayload(tok);
+  if(!pl||!pl.exp){el.innerHTML='<span class="mut">Token present (not a decodable JWT — expiry unknown).</span>';return;}
+  const env=tokenEnv(tok);
+  const left=pl.exp*1000-Date.now(), mins=Math.max(0,Math.round(left/60000));
+  const who=pl.full_name||pl.sub||"";
+  const when=new Date(pl.exp*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+  const cls=left<=0?"err":left<5*60000?"warn":"ok";
+  const txt=left<=0?`expired at ${when} — sign in again`:`expires ${when} (${mins} min)`;
+  const mismatch=env&&env!==want?` <span class="err">· this is a ${env} token but this field needs a ${want} one</span>`:"";
+  el.innerHTML=`<span class="${cls}">${who?esc(who)+" · ":""}${env?env+" · ":""}${txt}</span>${mismatch}`;
+}
+function tokenStatus(){
+  tokenLine("cat_token","tokstatus","sandbox");
+  if(MODE==="prod") tokenLine("src_cat_token","srctokstatus","prod");
+}
+// Everything on the page that depends on the mode toggle.
+function refreshModeUI(){
+  const prod=MODE==="prod";
+  document.querySelectorAll(".prodonly").forEach(d=>{d.style.display=prod?"":"none";});
+  // the sandbox source key reads a SANDBOX source's webhooks; a prod source uses the
+  // production key instead, so the field would do nothing here
+  document.querySelectorAll(".sandboxonly").forEach(d=>{d.style.display=prod?"none":"";});
+  $("cat_token_label").textContent=prod?"Target CAT token (SANDBOX — writes go here)":"CAT API key (Bearer token)";
+  const b=$("okta"); if(b) b.textContent="Sign in with Okta (sandbox CAT)";
+  $("modebanner").innerHTML=prod?`<div class="banner stop"><b>Prod → Sandbox.</b> The source is read from
+    <b>PRODUCTION</b> CAT (read-only); everything is created in <b>sandbox</b>. Not carried from prod:
+    bank details (the payout step blocks until you supply a sandbox test account), acquirer credentials,
+    authorization keys and card acceptor ids, webhook receivers (re-pointed at the URL you give, or skipped).
+    Saved captures and journals are redacted.</div>`:"";
+  tokenStatus();
+}
+
 // Prefill from the server's dev-creds files (the sandbox keys come from the gitignored
-// dev-creds.local.json). The CAT token is never cached — it is pasted every session.
+// dev-creds.local.json). The CAT token is never cached — it comes from Okta or is pasted.
 if(window.__DEV_CREDS__){const c=window.__DEV_CREDS__;
   if(c.client_id&&$("src_client"))$("src_client").value=c.client_id;
   if(c.cat_token&&$("cat_token"))$("cat_token").value=c.cat_token;
@@ -1115,6 +1275,12 @@ if(window.__DEV_CREDS__){const c=window.__DEV_CREDS__;
   if(c.sandbox_pk&&$("sbox_pk"))$("sbox_pk").value=c.sandbox_pk;}
 $("capture").onclick=capture;
 $("loadents").onclick=loadEntities;
+$("okta").onclick=()=>startOktaLogin("sandbox");
+$("okta_src").onclick=()=>startOktaLogin("prod");
+$("cat_token").addEventListener("input",tokenStatus);
+$("src_cat_token").addEventListener("input",tokenStatus);
+finishOktaLogin();                 // returning from Okta? pick the token out of the fragment
+refreshModeUI(); setInterval(tokenStatus,60000);
 showTab(0);
 </script>
 </body>
