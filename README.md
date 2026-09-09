@@ -72,8 +72,8 @@ Python **3.9+** and nothing else — pure standard library. No dependencies to i
 ### Tests
 
 ```bash
-python3 tests/test_plan.py        # 284 tests, well under a second
-python3 tests/mutation_check.py   # 136 mutants — proves those tests have teeth
+python3 tests/test_plan.py        # 296 tests, well under a second
+python3 tests/mutation_check.py   # 143 mutants — proves those tests have teeth
 ```
 
 No token, no network, no writes. The suite asserts on the plan document and on a dry run:
@@ -290,8 +290,16 @@ modes): every CAT list is now read to `total_count` (`Reader.hal_all`); a list t
 not be completed is flagged `list_truncated` instead of trusted — 25 items was a silent
 ceiling before, and a production client is where it would have bitten.
 
-Not yet done for prod (TODO §00.5): BIN validation, a prod NT-portal host, and the first
-live prod capture itself — do that read-only (capture + dry run) before any apply.
+**Live so far (2026-09-09, production client `cli_4ucq…`, one entity):** the first attempt
+never reached CAT — the swagger's prod hostname does not resolve (see the host note above).
+Four applies then followed, each stopping on a production-only field that the create
+requires and the scrub had removed, fixed in turn: `siret_required` (a Cartes Bancaires
+profile → placeholder SIRET), `custom_settings_se_ccy_0_invalid` (Amex → sandbox's own SE
+numbers), `invalid_prism_merchant_service` (a channel with a legacy opaque prism key → the
+clone's key read back), and `region_required` (a workflow with `aws` actions → per-type
+action allowlist). The latest run created **115 of 116 steps**, with both webhook workflows
+read back on the clone. Still open (TODO §00.5): BIN validation, a prod NT-portal host, and
+a manual-values form on the Apply page for the blocked payout-setting step.
 
 ---
 
