@@ -39,8 +39,11 @@ warnings open every page so they are never out of sight — each warning carries
 (its flag code) and a coloured pill saying what happened: *object still created — only this
 value is left out*, *not created*, *value substituted*, *needs a value from you*:
 
-- **Capture** — what was fetched from the source (client, scope, CAT calls, saved capture),
-  what will be created, and what will not.
+- **Capture** — while it runs, a progress bar of what has been **read** so far (the server
+  reports every completed GET, stamped with its phase; the page polls it like the apply
+  bar): indeterminate until the entity list is in, then "entity 2 of 3 · processing
+  channels", then the tail. When done it shows what was fetched from the source (client,
+  scope, CAT calls, saved capture), what will be created, and what will not.
 - **Plan** — every endpoint the apply will hit (grouped, and in order), the dry run, and
   the delete/deactivate steps cleanup will be able to offer afterwards.
 - **Apply** — the live-apply box, live progress as each step is journalled (the page polls
@@ -129,9 +132,13 @@ client_api_secret_key → client_api_public_key → webhook_workflow → webhook
 key registered on the client, so the run generates a keypair at apply time
 (`clone_keys.py`, pure stdlib), registers the public half (`POST /clients/{id}/public-keys`,
 `{name: "PUB KEY CAT SETUP nnnnn", type: "RSA", key: <PKCS#1 PEM>}`), creates a secret key
-and a public key (`POST /clients/{id}/standalone-reference-tokens` with every "secret"-side
-scope, then every "public"-side scope, from `GET /access-keys/configuration`; descriptions
-`CAT SETUP SECRET` / `CAT SET UP PUB`), and decrypts the two `temporary_secret`s with the
+and a public key (`POST /clients/{id}/standalone-reference-tokens`; descriptions
+`CAT SETUP SECRET` / `CAT SET UP PUB`). The **secret key carries only the workflow scopes**
+(`flow`, `flow:workflows`, `flow:events`, `notifier:workflows`) **and no entity
+assignment** — an entity-assigned key cannot create a workflow whose entity condition names
+another entity, and a key with every secret scope needs an entity (four live runs,
+2026-09-08). The public key carries every "public"-side scope from
+`GET /access-keys/configuration`. The run decrypts the two `temporary_secret`s with the
 private half — trying PKCS#1 v1.5 and OAEP, accepting only a result shaped like an API key.
 The private key lives in process memory for the run and nowhere else. The secret key is
 fed straight to the webhook steps that follow (a pasted Destination key wins if present);
@@ -151,7 +158,12 @@ source's with the *Source* Sandbox Secret Key (`GET /workflows`, then each
 entity and processing-channel conditions are remapped through the id map, and any id
 outside the capture's scope is dropped — a condition left empty means the workflow is
 **skipped and flagged** (`webhook_scope_emptied`), never created with a widened match. The
-event condition, the receiver URL, its headers and the signing key are carried as-is
+event condition is validated against `GET /workflows/event-types` (read at capture with the
+source key): a retired event — `gateway.payment_authorized` on the first live run, which
+made the whole create fail with `condition_event_types_invalid` — is left out and flagged
+(`webhook_event_dropped`, "will still be created, but …"); if the catalogue cannot be read
+nothing is filtered and `webhook_events_not_checked` says so. The receiver URL, its
+headers and the signing key are carried as-is
 (they *are* the configuration for a sandbox → sandbox clone); the URL is flagged
 (`webhook_url_carried`) so the operator confirms the receiver. Apply sends these with the
 *Destination* Sandbox Secret Key against `api.sandbox.checkout.com`. Both steps are
@@ -424,11 +436,12 @@ each is built or ruled out it should become a one-line manual-step flag like the
 
 **The new client's API keys are minted in the run — verified live** (2026-09-08): the
 public-key create accepts `{name, type, key}`, CAT encrypts secrets with **PKCS#1 v1.5**, and
-the minted secret authenticated against the sandbox API in the same run. **Webhooks are
-built but not yet landing:** the first live run's four `POST /workflows` all returned 422
-`condition_entity_entity_id_invalid` with correctly remapped entity ids. Bodies are now
-allowlisted per level; whether the rest is propagation delay or an entity-scoping rule is
-being settled by hand — TODO §00.7. Prod → Sandbox webhooks remain open (§00.5).
+the minted secret authenticated against the sandbox API in the same run. **Webhooks land**
+(run 2026-09-08T16:03Z: 3 of 4 created and read back; the 4th named a retired event type,
+now filtered). What it took: an allowlisted body, a secret key with only the workflow
+scopes and **no entity assignment** (an entity-assigned key cannot name other entities in a
+condition; a key with every scope needs an entity), and the event-type gate. Prod → Sandbox
+webhooks remain open (§00.5).
 
 ---
 

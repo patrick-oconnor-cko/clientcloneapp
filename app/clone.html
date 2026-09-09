@@ -54,6 +54,11 @@
   .bar{height:9px;background:#0d0f14;border:1px solid var(--edge);border-radius:6px;overflow:hidden;margin:8px 0 6px}
   .bar i{display:block;height:100%;background:var(--accent);transition:width .4s}
   .bar.fail i{background:var(--err)} .bar.ok i{background:var(--ok)}
+  /* indeterminate: the total is not known yet (a capture before its entity list is read) */
+  .bar.indet i{width:30%;animation:slide 1.2s linear infinite}
+  @keyframes slide{from{margin-left:-30%}to{margin-left:100%}}
+  #capprog{margin-top:8px} #capprog:empty{display:none}
+  #capprog .bar{margin:4px 0 3px}
   .steplog{font:11.5px ui-monospace,Menlo,monospace;max-height:220px;overflow:auto;background:var(--panel);
            border:1px solid var(--edge);border-radius:9px;padding:8px 12px;margin:6px 0 10px}
   .steplog div{padding:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -104,6 +109,7 @@
     <div class="hint">Read-only. Reads the source client and builds a clone plan.
       Nothing is created at this step.</div>
     <div class="hint" id="status"></div>
+    <div id="capprog"></div>
   </div>
 
   <div class="main">
@@ -280,6 +286,8 @@ const FLAG_LABELS={
   webhooks_not_read:"Webhooks not read",
   webhooks_unavailable:"Webhooks unavailable",
   webhook_scope_emptied:"Webhook out of scope",
+  webhook_event_dropped:"Webhook event retired",
+  webhook_events_not_checked:"Webhook events not checked",
   webhook_url_carried:"Webhook URL carried",
   webhook_missing_on_clone:"Webhook missing on clone",
   optional_step_blocked:"Optional step not sent",
@@ -318,6 +326,78 @@ function scopeLabel(){
   return `${SCOPE.length} of ${ENTITIES.length} entities — `+SCOPE.map(id=>byId[id]||id).join(", ");
 }
 
+// ---- progress polling, shared by capture and apply ----
+// The server records each completed read/step under the run_id the page picked; this
+// polls it once a second while the request is in flight. A poll already in flight when
+// the request finishes must not paint over the final result, hence the `finished` guard
+// as well as clearInterval. Returns the stop function.
+function pollProgress(runId, render){
+  let finished=false;
+  const t=setInterval(async()=>{
+    try{ const {body:p}=await post("/api/clone/progress",{run_id:runId});
+         if(!finished&&p&&!p.error) render(p); }catch(e){}
+  },1000);
+  return ()=>{finished=true; clearInterval(t);};
+}
+
+// ---- capture progress: what has been READ so far, stamped with the phase ----
+// Entries come from clone_capture's on_progress hook: {seq, kind, sub, entity_index,
+// entity_total, method, path, status}. The total is not known up front, so the bar is
+// indeterminate until the entity list has been read and determinate afterwards over
+// equal units: the client reads, each entity, and the tail (validity · scopes · webhooks).
+const CAP_SUBS=["detail","currency_accounts","processing_profiles","processing_channels",
+                "sessions_channels","payment_routing","payout_routing","payout_settings","payout_routes"];
+const CAP_TAIL=["validity","api_key_scopes","webhooks"];
+const CAP_LABEL={client:"client settings",risk_settings:"risk settings",compass_settings:"Compass settings",
+  flow_account:"Flow account",network_tokens:"network tokens",list:"entity list",detail:"entity detail",
+  currency_accounts:"currency accounts",processing_profiles:"processing profiles",
+  processing_channels:"processing channels & processors",sessions_channels:"sessions channels",
+  payment_routing:"payment routing rules",payout_routing:"payout routing rules",
+  payout_settings:"payout settings",payout_routes:"payout routes",configuration:"currency validity",
+  acquirers:"per-acquirer currencies",catalogue:"API key scopes",workflows:"webhooks",
+  event_types:"webhook event types",
+  validity:"currency validity",api_key_scopes:"API key scopes",webhooks:"webhooks"};
+// A capture tolerates 4xx on optional lookups (the payout-routes configuration 400s on
+// every capture and gates nothing), so only auth failures, transport errors and 5xx count
+// as failures for the bar's colour. Every non-2xx still shows as "!" in the log.
+const capFailed=e=>e.status===0||e.status===401||e.status===403||e.status>=500;
+function captureProgress(p,t0,seed){
+  const es=p.entries||[], n=es.length, last=es[n-1];
+  const failed=es.filter(capFailed).length;
+  const total=(last&&last.entity_total!=null)?last.entity_total:(seed!=null?seed:null);
+  let pct=null, phase="starting…";
+  if(p.done){ pct=100; phase="complete"; }
+  else if(last){
+    const sub=CAP_LABEL[last.sub]||last.sub||"";
+    if(total==null||last.kind==="client"){ phase=`reading ${sub}`; }
+    else{
+      const units=1+total+1; let done=1, frac=0;
+      if(last.kind==="entity"){ done=1+(last.entity_index-1); frac=(CAP_SUBS.indexOf(last.sub)+1)/CAP_SUBS.length;
+        phase=`entity ${last.entity_index} of ${total} · ${sub}`; }
+      else if(last.kind==="entities"){ done=1; phase=`entity list · ${total} to read`; }
+      else { done=1+total; frac=(CAP_TAIL.indexOf(last.kind)+1)/CAP_TAIL.length; phase=CAP_LABEL[last.kind]||last.kind; }
+      pct=Math.min(99,Math.round(100*(done+frac)/units));
+    }
+  } else if(seed!=null){ phase=`starting · ${seed} entities to read`; }
+  const cls=(pct==null?" indet":"")+(failed?" fail":(p.done?" ok":""));
+  const bar=`<div class="bar${cls}"><i style="width:${pct==null?30:pct}%"></i></div>`;
+  const head=`<b>${p.done?"Captured":"Capturing"} — ${esc(phase)}</b> <span class="mut">· ${n} reads · ${fmtDur(performance.now()-t0)}${failed?` · <span class="err">${failed} failed</span>`:''}</span>`;
+  const auth=es.filter(e=>e.status===401).length;
+  const hint=auth?`<div class="err">${auth} read${auth===1?"":"s"} returned 401 — token expired? Paste a fresh CAT token and capture again.</div>`:"";
+  return {pct,failed,n,
+    compact:`${bar}<div class="mut" style="font-size:11px">${p.done?"":"Capturing · "}${esc(phase)} · ${n} reads</div>`,
+    full:`<div class="banner">${head}${bar}
+      ${last?`<div class="mut">Last: <code>${esc(last.method)} ${esc(last.path)}</code> → ${esc(last.status)}</div>`:''}
+      ${hint}
+      <div class="steplog">${es.slice(-12).map(stepLine).join("")||'<div class="mut">no reads yet</div>'}</div>
+      Read-only. Nothing is created at this step; the plan appears here when the capture finishes.</div>`};
+}
+function renderCaptureProgress(p,t0,seed){
+  const r=captureProgress(p,t0,seed);
+  $("capprog").innerHTML=r.compact;
+  $("view").innerHTML=r.full;
+}
+
 async function capture(){
   const body={client_id:$("src_client").value.trim(),...creds(),
               new_client_name:$("new_name").value.trim()};
@@ -331,19 +411,31 @@ async function capture(){
   }
   $("capture").disabled=true;
   $("status").textContent="Reading source configuration…"; $("status").className="hint";
+  const runId="cap-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,8);
+  body.run_id=runId;
   const t0=performance.now();
+  const seed=ENTITIES?SCOPE.length:null;      // the server's entity_total overrides this
+  let lastP={entries:[],done:false};
+  renderCaptureProgress(lastP,t0,seed);
+  const stop=pollProgress(runId,p=>{lastP=p; renderCaptureProgress(p,t0,seed);});
   try{
     const {code,body:j}=await post("/api/clone/capture",body);
+    stop();
     const el=fmtDur(performance.now()-t0);
     if(code===501){ notImplemented(j,el); return; }
-    if(j.error){ $("status").innerHTML='<span class="err">'+esc(j.error)+'</span> <span class="mut">— after '+el+'</span>'; return; }
+    if(j.error){
+      // keep the log in view so the operator sees where the reads got to
+      renderCaptureProgress({...lastP,done:true},t0,seed);
+      $("capprog").innerHTML=captureProgress({...lastP,done:true,entries:(lastP.entries||[]).concat([{status:0}])},t0,seed).compact;
+      $("status").innerHTML='<span class="err">'+esc(j.error)+'</span> <span class="mut">— after '+el+'</span>'; return; }
     PLAN=j.plan||null; OUTLOOK=j.cleanup_outlook||null;
     CAPINFO={calls:j.calls,capture_path:j.capture_path,el,problems:j.problems||[]};
     // a fresh capture invalidates everything derived from the previous one
     DRYRUN=null; LASTRUN=null; VERIFY=null; for(const k in PANES) PANES[k]="";
     STAGE=2; showTab(0);
+    $("capprog").innerHTML=`<div class="bar ok"><i style="width:100%"></i></div><div class="mut" style="font-size:11px">${j.calls!=null?j.calls:(lastP.entries||[]).length} reads · ${el}</div>`;
     $("status").innerHTML='<span class="ok">Captured</span> <span class="mut">· '+el+'</span>';
-  }catch(e){ $("status").innerHTML='<span class="err">'+esc(e)+'</span>'; }
+  }catch(e){ stop(); $("status").innerHTML='<span class="err">'+esc(e)+'</span>'; }
   finally{ $("capture").disabled=false; }
 }
 
@@ -671,7 +763,7 @@ async function dryRun(){
     <table><tr><th>#</th><th>Kind</th><th>Resolved call</th><th>Would create</th></tr>
     ${r.journal.map(e=>`<tr>
       <td>${e.seq}</td><td>${esc(e.kind)}</td>
-      <td><code>${esc(e.method)} ${esc(e.path)}</code>${e.error?'<br><span class="err">'+esc(e.error)+'</span>':''}</td>
+      <td><code>${esc(e.method)} ${esc(e.path)}</code>${e.auth_source?' <span class="pill ok">'+esc(e.auth_source)+'</span>':''}${e.would_mint?' <span class="pill ok">mints the '+esc(e.would_mint.replace('sandbox_',''))+' key</span>':''}${e.error?'<br><span class="err">'+esc(e.error)+'</span>':''}</td>
       <td>${e.would_create?'<code>'+esc(e.would_create)+'</code>':'<span class="mut">—</span>'}</td>
     </tr>`).join("")}</table>
     <div class="toolbar"><button onclick="dlRun(DRYRUN,'clone-dry-run.json')">Download dry-run journal (.json)</button></div>`);
@@ -768,15 +860,7 @@ async function apply(){
   const runId="run-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,8);
   const t0=performance.now();
   showRun(progressHtml({total:n,entries:[]},t0));
-  // Poll the server for where the run is up to while the apply request is in flight. A
-  // poll already in flight when the run finishes must not paint over the final result,
-  // hence the `finished` guard as well as clearInterval.
-  let finished=false;
-  const poll=setInterval(async()=>{
-    try{ const {body:p}=await post("/api/clone/progress",{run_id:runId});
-         if(!finished&&p&&!p.error) pane("runview",progressHtml(p,t0)); }catch(e){}
-  },1000);
-  const stopPolling=()=>{finished=true; clearInterval(poll);};
+  const stopPolling=pollProgress(runId,p=>pane("runview",progressHtml(p,t0)));
   let j, code;
   try{
     ({code,body:j}=await post("/api/clone/apply",

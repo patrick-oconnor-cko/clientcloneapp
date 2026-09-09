@@ -75,18 +75,28 @@ def clone_capture_handler(payload):
         return {"error": "only_entities must be a list of entity ids"}
     only_entities = sorted({x.strip() for x in (raw_scope or [])
                             if isinstance(x, str) and x.strip()})
-    cap  = cc.capture(CAT_BASE, token, client_id,
-                      only_entity=(payload.get("only_entity") or "").strip() or None,
-                      only_entities=only_entities or None,
-                      # the SOURCE's secret key reads its webhooks; never the destination's
-                      sandbox_secret_key=keys.get("source_sandbox_secret"))
+    # Live progress for the page: it picks a run_id ("cap-…") and polls
+    # /api/clone/progress while this request is in flight; every completed read is
+    # recorded as it happens. total is unknown up front — the entries carry entity_total
+    # once the entity list has been read. Marked done whatever happens.
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    run_id = str(payload.get("run_id") or stamp)
+    progress_start(run_id, None, kind="capture")
+    try:
+        cap = cc.capture(CAT_BASE, token, client_id,
+                         only_entity=(payload.get("only_entity") or "").strip() or None,
+                         only_entities=only_entities or None,
+                         # the SOURCE's secret key reads its webhooks; never the destination's
+                         sandbox_secret_key=keys.get("source_sandbox_secret"),
+                         on_progress=lambda e: progress_step(run_id, e))
+    finally:
+        progress_finish(run_id)
     # Persist the RAW capture, every time, before anything is derived from it. When a
     # plan skips something, the question is always "what did CAT actually return?" — and
     # until now the only answer was to ask someone to paste it. Gitignored with the
     # journals; also the first real saved capture the tests have ever had available.
     cap_path = None
     try:
-        stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         cap_path = RUNS_DIR / f"capture-{stamp}-{client_id}.json"
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         cap_path.write_text(json.dumps(cap, indent=1, default=str), encoding="utf-8")
@@ -96,17 +106,19 @@ def clone_capture_handler(payload):
         scope = cap.get("only_entities") or ([cap["only_entity"]] if cap.get("only_entity") else [])
         return {"error": f"No entities found for {client_id} "
                          + (f"matching the selected entities {', '.join(scope)}. " if scope else "")
-                         + "(check the ids and that the token is valid/unexpired)."}
+                         + "(check the ids and that the token is valid/unexpired).",
+                "run_id": run_id, "calls": cap.get("_meta", {}).get("calls")}
     if cap.get("scope_missing"):
         # Refuse, don't guess: a plan for fewer entities than were ticked would apply
         # cleanly and leave the operator believing the clone is complete.
         return {"error": f"{len(cap['scope_missing'])} selected entity(ies) were not returned "
                          f"by CAT for {client_id}: {', '.join(cap['scope_missing'])}. "
                          f"Reload the entity list and tick again. Nothing was planned.",
-                "capture_path": str(cap_path)}
+                "capture_path": str(cap_path), "run_id": run_id}
     plan = cc.build_plan(cap, (payload.get("new_client_name") or "").strip() or None)
     return {"plan": plan, "problems": cc.validate_plan(plan),
             "calls": cap.get("_meta", {}).get("calls"),
+            "run_id": run_id,
             "capture_path": str(cap_path),
             # what cleanup could undo if this plan were applied — shown before committing
             "cleanup_outlook": ccl.cleanup_outlook(plan)}
@@ -169,12 +181,15 @@ def clone_apply_handler(payload):
 PROGRESS = {}
 PROGRESS_LOCK = threading.Lock()
 PROGRESS_FIELDS = ("seq", "kind", "op", "method", "path", "status", "error", "created_id",
-                   "resolved_id", "attempts", "auth", "elapsed_ms")
+                   "resolved_id", "attempts", "auth", "elapsed_ms",
+                   # capture stamps: which phase a read belonged to
+                   "sub", "entity_index", "entity_total")
 
 
-def progress_start(run_id, total):
+def progress_start(run_id, total, kind="apply"):
+    """total may be None: a capture's read count is not known until it has happened."""
     with PROGRESS_LOCK:
-        PROGRESS[run_id] = {"total": total, "entries": [], "done": False,
+        PROGRESS[run_id] = {"total": total, "kind": kind, "entries": [], "done": False,
                             "started_at": datetime.datetime.utcnow().isoformat() + "Z"}
 
 
@@ -201,6 +216,7 @@ def clone_progress_handler(payload):
         if p is None:
             return {"error": f"unknown run_id {run_id!r}"}
         return {"run_id": run_id, "total": p["total"], "done": p["done"],
+                "kind": p.get("kind", "apply"),
                 "started_at": p["started_at"], "entries": [dict(e) for e in p["entries"]]}
 
 

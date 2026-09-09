@@ -520,6 +520,15 @@ MUTATIONS = [
     ("webhook condition sends the SOURCE entity/channel ids", "app/clone_capture.py",
      '            c[field] = [ph(s) for s in kept]',
      '            c[field] = list(kept)'),
+    ("retry budget burnt on any error, not just the propagation code", "app/clone_apply.py",
+     '            if only and only not in (err or ""):\n                break',
+     '            if False:\n                break'),
+    ("retired event types sent to the create unfiltered", "app/clone_capture.py",
+     '                ok = [n for n in names if n in valid]',
+     '                ok = list(names)'),
+    ("a workflow left with no valid event is created empty", "app/clone_capture.py",
+     '            if not kept:\n                emptied = emptied or "event"',
+     '            if False:\n                emptied = emptied or "event"'),
     ("workflow read-only fields echoed into the create (allowlist dropped)", "app/clone_capture.py",
      '        c = {k: v for k, v in c.items() if k in WORKFLOW_CONDITION_FIELDS}',
      '        c = {k: v for k, v in c.items() if k not in ("id", "_links")}'),
@@ -530,12 +539,30 @@ MUTATIONS = [
      '                op="Workflows_Add", notes=notes, label=name, optional=True,\n'
      '                auth="sandbox_secret")',
      '                op="Workflows_Add", notes=notes, label=name, optional=True)'),
+    ("secret key minted with an entity assignment again", "app/clone_capture.py",
+     '             "entity_id": "", "allow_any_processing_channel": True,\n'
+     '             "processing_channel_ids": []},\n'
+     '            requires=[src_cli, PUBLIC_CRYPTO_KEY_PROVIDES],\n'
+     '            op="StandaloneReferenceTokens_Create", optional=True,\n'
+     '            label=API_KEY_DESCRIPTIONS["client_api_secret_key"], notes=sk_notes)',
+     '             "entity_id": ph(cap["entities"][0]["id"]), "allow_any_processing_channel": True,\n'
+     '             "processing_channel_ids": []},\n'
+     '            requires=[src_cli, PUBLIC_CRYPTO_KEY_PROVIDES, cap["entities"][0]["id"]],\n'
+     '            op="StandaloneReferenceTokens_Create", optional=True,\n'
+     '            label=API_KEY_DESCRIPTIONS["client_api_secret_key"], notes=sk_notes)'),
+    ("secret key minted with every secret scope, not just the workflow ones", "app/clone_capture.py",
+     '        sk_scopes = [s for s in WEBHOOK_SECRET_KEY_SCOPES if s in scopes["secret"]]',
+     '        sk_scopes = list(scopes["secret"])'),
     ("a workflow scoped only outside the capture is created anyway", "app/clone_capture.py",
      '            if not kept:\n                emptied = emptied or c.get("type")',
      '            if False:\n                emptied = emptied or c.get("type")'),
     ("a blocked optional step halts the whole run", "app/clone_apply.py",
      '        if auth_err and not miss and step.get("optional"):',
      '        if False:'),
+
+    ("dry run forgets that the run mints the destination key", "app/clone_apply.py",
+     '                    sandbox_keys[role] = SANDBOX_KEY_PREFIX[role] + f"dryrunminted{seq:04d}".ljust(26, "x")',
+     '                    pass'),
 
     # -- destination API keys: decrypted in-run, used for webhooks, never journalled -----
     ("minted secret key not fed to the sandbox-API steps", "app/clone_apply.py",
@@ -552,6 +579,17 @@ MUTATIONS = [
     ("API key steps emitted without the scope catalogue", "app/clone_capture.py",
      '        scopes = cap.get("api_key_scopes")\n        if not scopes:',
      '        scopes = cap.get("api_key_scopes") or {"secret": [], "public": []}\n        if False:'),
+
+    # -- capture progress: every read reported, stamped, and stored under the run_id ------
+    ("capture progress hook never fires", "app/clone_capture.py",
+     '        if self.on_call:\n            try:\n                self.on_call(path, code, self.calls)',
+     '        if False:\n            try:\n                self.on_call(path, code, self.calls)'),
+    ("capture progress not registered under the page's run_id", "app/server.py",
+     '    progress_start(run_id, None, kind="capture")',
+     '    pass'),
+    ("entity count never stamped on capture progress", "app/clone_capture.py",
+     '    mark("entities", "list", entity_total=len(ents))',
+     '    mark("entities", "list")'),
 
     # -- live progress: the page must be told about every step, and told the truth --
     ("progress listener never told about a step", "app/clone_apply.py",

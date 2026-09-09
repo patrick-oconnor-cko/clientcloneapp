@@ -8,8 +8,12 @@
   finished. That step has since been removed (see below); a plan built from the same
   capture now yields **86 steps, none optional**. 3-entity reference client
   `cli_scna7ew7mxdenl3h36zlmkyh6m`.
-- **Tests:** `python3 tests/test_plan.py` → 252 pass. `python3 tests/mutation_check.py` →
-  115/115 mutants caught. Both need no token or network. (The suite patches
+- **Tests:** `python3 tests/test_plan.py` → 267 pass. `python3 tests/mutation_check.py` →
+  126/126 mutants caught.
+- **Capture progress bar (2026-09-08):** `Reader.on_call` → `capture(on_progress=…)` stamps
+  every read `{seq, kind, sub, entity_index, entity_total, path, status}`; the server keeps
+  it under the page's `cap-…` run_id (`progress_start(kind="capture", total=None)`); the page
+  polls with the shared `pollProgress()`. Last `seq` == `_meta.calls` by construction. Both need no token or network. (The suite patches
   `clone_keys.generate` to one shared 1024-bit key so live-mock applies stay fast.)
 - **Destination API keys minted in the run (2026-09-08), not yet run live** — see §00.7a.
   The Destination Sandbox Secret Key box is now optional.
@@ -115,12 +119,22 @@ None of them is flagged yet except pricing profiles (in `skipped[]`).
    the entity ids sent WERE the clone's new ids (remapping correct), sent ~22s after the
    last entity create. Fixed since: bodies are now an allowlist per level (the read carried
    `created_at`/`updated_at` on every condition/action) and the read-back no longer
-   re-reports a webhook whose create failed. **Still open — settle with two manual POSTs**
-   (bodies in `clone-runs/webhook90_clean.json` and `…_no_entity.json`, sent with the
-   minted destination key): if the clean body succeeds later, it was propagation → add a
-   retry (like `vault_lookup`) to `webhook_workflow`; if only the no-entity body succeeds,
-   the entity condition is the constraint (key scoped to `entity_id`? entities not yet
-   known to the Workflows service?) → try minting the secret key with `entity_id: ""`.
+   re-reports a webhook whose create failed. Second run (15:30Z) sent clean bodies and
+   still 422'd — so not the timestamps. Third run (15:38Z): secret key with ALL 91 secret
+   scopes and `entity_id: ""` → **503 `unexpected_access_keys_api_response`** (several of
+   those scopes are entity-bound). Fourth run (15:48Z): entity-assigned key again, webhook
+   creates retried **5 × 20s on the exact error — all still 422**, so it is NOT propagation.
+   **Patrick's diagnosis:** the secret key's entity assignment is what makes a workflow's
+   entity condition "invalid" for any other entity. **Now:** the secret key is minted with
+   only `flow`, `flow:workflows`, `flow:events`, `notifier:workflows` and **no entity**
+   (`WEBHOOK_SECRET_KEY_SCOPES`); the retry is gone (`retry.when_error_contains` stays as a
+   mechanism). **Fifth run (16:03Z): 3 of 4 created and read back** — Patrick's diagnosis
+   was right. The 4th ('Capture test') 422'd `condition_event_types_invalid`: it names
+   `gateway.payment_authorized`, which `GET /workflows/event-types` no longer lists.
+   **Built:** capture reads the catalogue (`workflow_event_types`), `workflow_create_body`
+   filters event conditions, retired events are flagged `webhook_event_dropped` ("will still
+   be created, but …"), an all-retired workflow is skipped, an unreadable catalogue flags
+   `webhook_events_not_checked`. Next run should be 4 of 4 with one warning.
    Workflows in
    the Checkout sandbox API (contract via `checkout-mcp-sandbox`: `addWorkflow` accepts
    nested `conditions[]` + `actions[]` in one POST; `get-webhook-action` returns `url`,

@@ -461,6 +461,7 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
     keypair = None            # the run's RSA keypair, generated when the crypto-key step runs
     destination_keys = {}     # role -> {kind, id, description, value, padding}; shown once
     failed_labels = set()     # labels of steps that failed live — read-back checks skip them
+    minted_at = {}            # role -> seq of the step that mints it (live: did; dry run: would)
     t_start = time.time()
     jrn = Journal(journal_path, {
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -515,6 +516,8 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
         bearer, auth_base, auth_err = bearer_for(step, token, sandbox_keys)
         if (step.get("auth") or "cat") != "cat":
             entry["auth"] = step["auth"]
+            if step["auth"] in minted_at and not auth_err:
+                entry["auth_source"] = f"key minted at step {minted_at[step['auth']]}"
 
         if miss:
             entry.update(status="blocked", error=f"unresolved placeholders: {', '.join(miss)}")
@@ -554,6 +557,16 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                 new_id = synth_id(step["provides"], seq)
                 id_map[step["provides"]] = new_id
                 entry["would_create"] = new_id
+            if kind in API_KEY_STEPS:
+                # The live run mints this key here and later steps use it, so the dry run
+                # must model that instead of reporting them blocked (first live run's dry
+                # run did, and it read as "supply a key" when none was needed). A pasted key
+                # still wins, exactly as it does live.
+                role = API_KEY_STEPS[kind]
+                if not sandbox_keys.get(role):
+                    sandbox_keys[role] = SANDBOX_KEY_PREFIX[role] + f"dryrunminted{seq:04d}".ljust(26, "x")
+                    minted_at[role] = seq
+                    entry["would_mint"] = role
             record(entry); created += 1
             continue
 
@@ -578,6 +591,11 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                     else resp.get("id")
                 ok = got is not None
             if ok or attempt == attempts:
+                break
+            # A retry may be limited to one error: anything else is not a race and must
+            # fail now rather than burn the whole retry budget on a hard rejection.
+            only = rr.get("when_error_contains")
+            if only and only not in (err or ""):
                 break
             time.sleep(delay)
         if attempts > 1:
@@ -631,6 +649,7 @@ def apply_plan(plan, base=None, token=None, dry_run=True, stop_on_error=True,
                                           "prefix": value[:8]}
                     if role == "sandbox_secret" and not sandbox_keys.get("sandbox_secret"):
                         sandbox_keys["sandbox_secret"] = value
+                        minted_at[role] = seq
                         entry["decrypted"]["used_for"] = "sandbox_secret steps in this run"
                 except ValueError as ex:
                     f = {"code": "api_key_undecryptable", "kind": kind, "seq": seq,

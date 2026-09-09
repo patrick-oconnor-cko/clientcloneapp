@@ -609,7 +609,8 @@ def reference_capture():
         "workflows_source": "sandbox-api",
         # Shaped like api_key_scopes_from(GET /access-keys/configuration): the scope names
         # each side of API key may carry. Drives the three destination-key steps.
-        "api_key_scopes": {"secret": ["gateway", "notifier:events", "notifier:workflows"],
+        "api_key_scopes": {"secret": ["flow", "flow:events", "flow:workflows", "gateway",
+                                      "notifier:events", "notifier:workflows"],
                            "public": ["middleware:merchants-public", "payment-sessions:pay",
                                       "vault:tokenization"]},
         "_meta": {"calls": 47, "errors": []},
@@ -655,6 +656,16 @@ def _workflow(tag, name, entity_ids=(), channel_ids=(), url="https://merchant.ex
             "_links": link(""), **ts}
 
 
+# Shaped like GET /workflows/event-types (a list of sources, each with its events). Every
+# event the fixture workflows name is in here, so the reference webhook plan stays clean.
+WORKFLOW_EVENT_TYPES = {
+    "gateway": ["card_verified", "payment_approved", "payment_captured", "payment_declined",
+                "payment_pending", "payment_refunded", "payment_voided"],
+    "dispute": ["dispute_evidence_required", "dispute_lost", "dispute_won"],
+    "sessions": ["authentication_approved", "authentication_failed"],
+}
+
+
 def webhooks_capture():
     """Reference client with two workflows: one scoped to the captured entity and its
     channel (cloned), one scoped only to an entity outside the capture (skipped)."""
@@ -666,6 +677,32 @@ def webhooks_capture():
                   channel_ids=[pcid]),
         _workflow("outscope", "Other entity webhook", entity_ids=[_id("ent", "elsewhere")]),
     ]
+    cap["workflow_event_types"] = copy.deepcopy(WORKFLOW_EVENT_TYPES)
+    return cap
+
+
+def webhooks_with_retired_event_capture():
+    """The first live webhook run: a source workflow names gateway.payment_authorized,
+    which the platform no longer offers — the create refuses the whole workflow unless
+    that one event is left out. A second workflow names only retired events."""
+    cap = webhooks_capture()
+    eid = cap["entities"][0]["id"]
+    stale = _workflow("stale", "Capture test", entity_ids=[eid])
+    stale["conditions"][0]["events"] = {
+        "gateway": ["payment_authentication_failed", "payment_authorized", "payment_captured"],
+        "sessions": ["authentication_approved", "error_details"]}
+    dead = _workflow("dead", "Legacy only", entity_ids=[eid])
+    dead["conditions"][0]["events"] = {"gateway": ["payment_authorized"], "legacy_source": ["x"]}
+    cap["workflows"] += [stale, dead]
+    cap["workflow_event_types"]["gateway"].append("payment_authentication_failed")
+    return cap
+
+
+def webhooks_without_key_minting_capture():
+    """Webhooks to clone but no scope catalogue, so no destination key is minted in the run:
+    the webhook steps then depend on a pasted Destination Sandbox Secret Key."""
+    cap = webhooks_capture()
+    cap["api_key_scopes"] = None
     return cap
 
 
@@ -673,6 +710,7 @@ def webhooks_not_read_capture():
     """No source secret key was supplied, so the workflows were never read."""
     cap = reference_capture()
     cap["workflows"], cap["workflows_source"] = None, "no_key"
+    cap["workflow_event_types"] = None
     return cap
 
 

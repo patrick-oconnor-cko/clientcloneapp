@@ -439,9 +439,14 @@ class Reader:
         self.token = token
         self.calls = 0
         self.errors = []
+        # Optional progress listener: on_call(path, http_code, calls_so_far), fired once
+        # per read AFTER it completes. Never sees the token or the response. A listener
+        # that raises is swallowed — it can never change what a read returns (same
+        # contract as apply_plan's on_step). capture() attaches one to stamp phases.
+        self.on_call = None
 
-    def get(self, path):
-        self.calls += 1
+    def _fetch(self, path):
+        """One HTTP GET -> (json, status). The seam tests replace to answer from fixtures."""
         req = urllib.request.Request(self.base + path, headers={
             "Authorization": "Bearer " + self.token, "Accept": "application/json"})
         try:
@@ -453,6 +458,16 @@ class Reader:
         except Exception as e:
             self.errors.append({"path": path, "error": str(e)})
             return {}, 0
+
+    def get(self, path):
+        self.calls += 1
+        data, code = self._fetch(path)
+        if self.on_call:
+            try:
+                self.on_call(path, code, self.calls)
+            except Exception:
+                pass
+        return data, code
 
     def hal(self, path, key):
         d, code = self.get(path)
@@ -497,23 +512,67 @@ def read_workflows(reader):
     return out, "sandbox-api"
 
 
-def workflow_create_body(wf, entity_ids, channel_ids):
+def read_event_types(reader):
+    """GET /workflows/event-types -> {source: [event ids]} or None if it could not be read.
+
+    The catalogue is a list of sources, each {id, display_name, description, events: [{id,
+    …}]}. A source workflow can name an event the platform has since retired (the first
+    live webhook run: gateway.payment_authorized), and the create then rejects the WHOLE
+    workflow with condition_event_types_invalid — so build_plan filters against this, the
+    same way currencies are filtered against CAT's lists. None means "not checked", never
+    "nothing is valid".
+    """
+    d, code = reader.get("/workflows/event-types")
+    items = d if isinstance(d, list) else (d.get("data") if isinstance(d, dict) else None)
+    if not (200 <= code < 300) or not isinstance(items, list):
+        return None
+    out = {}
+    for it in items:
+        if not isinstance(it, dict) or not it.get("id"):
+            continue
+        out[it["id"]] = sorted({(e.get("id") if isinstance(e, dict) else e)
+                                for e in (it.get("events") or []) if e} - {None})
+    return out or None
+
+
+def workflow_create_body(wf, entity_ids, channel_ids, event_types=None):
     """Turn a source workflow detail into an add-workflow-request body.
 
-    Returns (body, requires, notes, emptied). Ids and _links are stripped at every level;
-    entity and processing-channel conditions are remapped to placeholders for the clone's
-    ids, and any id outside the capture's scope is dropped with a note. `emptied` names a
-    condition type whose id list became empty — such a workflow must not be created (the
-    request requires at least one id, and the intent cannot be honoured). Event conditions,
-    the webhook action's url, headers and signature are carried as-is: for a sandbox ->
-    sandbox clone they ARE the configuration; build_plan flags the url so the operator
-    confirms the receiver.
+    Returns (body, requires, notes, emptied, dropped_events). Ids and _links are stripped
+    at every level; entity and processing-channel conditions are remapped to placeholders
+    for the clone's ids, and any id outside the capture's scope is dropped with a note.
+    `emptied` names a condition type whose list became empty — such a workflow must not be
+    created (the request requires at least one entry, and the intent cannot be honoured).
+    With `event_types` (the catalogue from read_event_types) the event condition is filtered
+    to events the platform still offers; each retired one is returned in `dropped_events`
+    as (source, event) so build_plan can flag it — the workflow is still created without
+    it. None = not checked, events pass through. The webhook action's url, headers and
+    signature are carried as-is: for a sandbox -> sandbox clone they ARE the configuration;
+    build_plan flags the url so the operator confirms the receiver.
     """
     body = {k: v for k, v in (wf or {}).items() if k in WORKFLOW_FIELDS and v is not None}
-    requires, notes, emptied = [], [], None
+    requires, notes, emptied, dropped_events = [], [], None, []
     conds = []
     for c in body.get("conditions") or []:
         c = {k: v for k, v in c.items() if k in WORKFLOW_CONDITION_FIELDS}
+        if c.get("type") == "event" and event_types is not None:
+            kept = {}
+            for source, names in (c.get("events") or {}).items():
+                valid = event_types.get(source)
+                if valid is None:
+                    dropped_events.extend((source, n) for n in names)
+                    continue
+                ok = [n for n in names if n in valid]
+                dropped_events.extend((source, n) for n in names if n not in valid)
+                if ok:
+                    kept[source] = ok
+            if dropped_events:
+                notes.append("event condition: dropped "
+                             + ", ".join(f"{s}.{n}" for s, n in dropped_events)
+                             + " — no longer event types on the platform")
+            if not kept:
+                emptied = emptied or "event"
+            c["events"] = kept
         field = WORKFLOW_SCOPED_CONDITIONS.get(c.get("type"))
         if field:
             known = entity_ids if field == "entities" else channel_ids
@@ -530,7 +589,7 @@ def workflow_create_body(wf, entity_ids, channel_ids):
     body["conditions"] = conds
     body["actions"] = [{k: v for k, v in a.items() if k in WORKFLOW_ACTION_FIELDS}
                        for a in body.get("actions") or []]
-    return body, requires, notes, emptied
+    return body, requires, notes, emptied, dropped_events
 
 
 # ---------------------------------------------------------------- API keys (destination)
@@ -555,6 +614,12 @@ PUBLIC_KEY_PEM_MARKER = "<<RUN_PUBLIC_KEY_PEM>>"
 PUBLIC_CRYPTO_KEY_PROVIDES = "pck_runpubliccryptokeyxxxxxxxx"
 API_KEY_DESCRIPTIONS = {"client_api_secret_key": "CAT SETUP SECRET",
                         "client_api_public_key": "CAT SET UP PUB"}
+# The secret key exists to create the clone's webhooks, so it carries ONLY the workflow
+# scopes and NO entity assignment (Patrick, 2026-09-08). Four live runs taught the rest: a
+# key created with every secret-side scope needs an entity_id (empty -> 503), and a key
+# assigned to an entity cannot create a workflow whose entity condition names any other
+# entity (422 condition_entity_entity_id_invalid, unchanged by 5 x 20s of retries).
+WEBHOOK_SECRET_KEY_SCOPES = ["flow", "flow:workflows", "flow:events", "notifier:workflows"]
 
 
 def api_key_scopes_from(config):
@@ -600,9 +665,23 @@ def scope_entities(ents, only_entity=None, only_entities=None):
     return kept, [w for w in wanted if w not in found]
 
 
+# The sub-phases of one entity's reads, in order — the page turns the index of the current
+# one into how far through the entity the capture is. Keep in step with the mark() calls
+# in capture() and CAP_SUBS in clone.html.
+CAPTURE_ENTITY_SUBS = ("detail", "currency_accounts", "processing_profiles",
+                       "processing_channels", "sessions_channels", "payment_routing",
+                       "payout_routing", "payout_settings", "payout_routes")
+
+
 def capture(base, token, client_id, only_entity=None, only_entities=None,
-            sandbox_secret_key=None, sandbox_api_base=SANDBOX_API_BASE):
+            sandbox_secret_key=None, sandbox_api_base=SANDBOX_API_BASE, on_progress=None):
     """Read the source configuration. Returns a raw capture dict.
+
+    on_progress: optional callable(entry) fired once per completed read, with
+    {seq, kind, sub, entity_index, entity_total, method, path, status} — what has
+    HAPPENED, stamped with the phase the capture is in. seq counts every read across all
+    three readers, so the last seq equals cap["_meta"]["calls"]. Fire-and-forget: it can
+    never change the capture (a raising listener is swallowed by Reader).
 
     only_entities: restrict the capture (and therefore the plan) to these ent_* ids — the
     entities ticked on the page. only_entity is the older single-id form and still works.
@@ -619,16 +698,41 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
            "only_entities": sorted({*(only_entities or []), *([only_entity] if only_entity else [])}) or None,
            "scope_missing": []}
 
+    # Progress stamping. `state` is what phase the NEXT reads belong to; mark() moves it
+    # at the section boundaries below. The hook is attached to every Reader this capture
+    # makes, so seq runs across CAT, the NT portal and the sandbox API alike.
+    state = {"kind": "client", "sub": "client", "entity_index": None, "entity_total": None}
+    seq = [0]
+
+    def hook(path, code, _calls):
+        if on_progress is None:
+            return
+        seq[0] += 1
+        on_progress({"seq": seq[0], "kind": state["kind"], "sub": state["sub"],
+                     "entity_index": state["entity_index"],
+                     "entity_total": state["entity_total"],
+                     "method": "GET", "path": path, "status": code})
+
+    def mark(kind, sub=None, **fields):
+        state.update(kind=kind, sub=sub, **fields)
+
+    r.on_call = hook
+
+    mark("client", "client")
     cap["client"], _ = r.get(f"/clients/{client_id}")
     # Client-level risk settings (the Fraud Detection tier). A new client comes up on
     # the free tier; the source's tier is applied by a PUT straight after client create.
+    mark("client", "risk_settings")
     cap["risk_settings"], _ = r.get(f"/clients/{client_id}/risk-settings")
     # Compass (Dashboard) settings: display currency + conversion currencies. Also
     # client-level; a new client does not inherit them.
+    mark("client", "compass_settings")
     cap["compass_settings"], _ = r.get(f"/clients/{client_id}/compass-settings")
     # Flow (hosted checkout) account: client-level, a single is_enabled flag. The `acc_*`
     # id CAT returns is client-specific and never copied — like the vault account.
+    mark("client", "flow_account")
     cap["flow_account"], _ = r.get(f"/clients/{client_id}/flow-account")
+    mark("client", "network_tokens")
     # Network Tokens. CAT's own GET /clients/{id}/network-tokens returns the BLANK CREATE
     # TEMPLATE — every field carries only a default_value, default_entity_id has no value
     # at all — regardless of what the client has configured (confirmed live: the source
@@ -640,24 +744,31 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
     portal_nt = None
     if not (network_token_form_values(cat_nt) or {}).get("default_entity_id"):
         rp = Reader(NT_PORTAL_BASE, token)
+        rp.on_call = hook
         portal_nt, _ = rp.get(f"/{client_id}")
         r.calls += rp.calls
         r.errors.extend(rp.errors)
     cap["network_tokens"], cap["network_tokens_source"] = \
         choose_network_tokens_form(cat_nt, portal_nt)
     cap["network_tokens_cat_raw"] = cat_nt      # kept for diagnosis
+    mark("entities", "list")
     ents, _ = r.hal(f"/clients/{client_id}/entities?limit=25&skip=0", "entities")
     ents, cap["scope_missing"] = scope_entities(ents, only_entity, only_entities)
+    # from here on every stamp carries how many entities there are to read
+    mark("entities", "list", entity_total=len(ents))
 
-    for e in ents:
+    for i, e in enumerate(ents, 1):
         eid = e.get("id")
+        mark("entity", "detail", entity_index=i)
         detail, _ = r.get(f"/entities/{eid}")
         ent = {"id": eid, "detail": detail or e}
 
+        mark("entity", "currency_accounts")
         ent["currency_accounts"], _ = r.hal(
             f"/entities/{eid}/currency-accounts?limit=25&skip=0", "currency_accounts")
 
         # profiles: list gives ids, v2 detail gives the clonable custom_settings
+        mark("entity", "processing_profiles")
         plist, _ = r.hal(f"/entities/{eid}/processing-profiles?limit=25&skip=0",
                          "processing_profiles")
         ent["processing_profiles"] = []
@@ -669,6 +780,7 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
         # channels: detail gives the channel body; per-processor detail is REQUIRED to
         # recover billing_information / authorization_key / acquirer_settings, none of
         # which appear in the channel's nested processors[] array.
+        mark("entity", "processing_channels")
         clist, _ = r.hal(f"/entities/{eid}/processing-channels?limit=25&skip=0",
                          "processing_channels")
         ent["processing_channels"] = []
@@ -685,6 +797,7 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
         # `services`, which is REQUIRED on create (`services_required`). Only the detail
         # carries it, so fetch per channel. Note its shape differs from a gateway channel's
         # services: {"value": "vault", ...} rather than {"type": "vault", ...}.
+        mark("entity", "sessions_channels")
         slist, _ = r.hal(
             f"/entities/{eid}/sessions-processing-channels?limit=25&skip=0",
             "sessions_processing_channels")
@@ -696,6 +809,7 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
         # routing rules: list ids, then detail for the actual conditions
         for kind, seg, key in (("payment_routing", "payment-routing-rules", "routing_rules"),
                                ("payout_routing", "payout-routing-rules", "routing_rules")):
+            mark("entity", kind)
             lst, _ = r.hal(f"/entities/{eid}/{seg}?limit=25&skip=0", key)
             out = []
             for x in lst:
@@ -703,6 +817,7 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
                 out.append(d if code == 200 else x)
             ent[kind] = out
 
+        mark("entity", "payout_settings")
         pset, _ = r.hal(f"/entities/{eid}/payout-settings?limit=25&skip=0", "payout_settings")
         ent["payout_settings"] = []
         for s in pset:
@@ -715,9 +830,11 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
         # corridors too, which a clone must never turn on; only the enabled ones are the
         # source's real footprint. These are never POSTed — see the parity check in
         # build_plan.
+        mark("entity", "payout_routes")
         ent["payout_routes"], _ = r.hal(
             f"/entities/{eid}/payout-routes?enabled=true", "data")
         cap["entities"].append(ent)
+    mark("validity", "configuration", entity_index=None)
 
     # ---- valid currency sets, straight from CAT --------------------------------
     #
@@ -759,6 +876,7 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
             for pr in c.get("processors", []):
                 if pr.get("acquirer_id"):
                     acquirers.add(pr["acquirer_id"])
+    mark("validity", "acquirers")
     for a in sorted(acquirers):
         d, code = r.get("/processors/configuration/currencies?acquirerId="
                         + urllib.parse.quote(a))
@@ -779,18 +897,25 @@ def capture(base, token, client_id, only_entity=None, only_entities=None,
     # here (the catalogue is CAT-wide; the clientId is only required by the route) so the
     # plan can mint the destination's two keys with every scope of the right side —
     # Patrick's known-good calls used exactly that. side_label is "secret" or "public".
+    mark("api_key_scopes", "catalogue")
     d, code = r.get(f"/access-keys/configuration?clientId={client_id}")
     cap["api_key_scopes"] = api_key_scopes_from(d) if 200 <= code < 300 else None
 
     # Webhooks: the one read against the Checkout sandbox API rather than CAT. Needs the
     # source's secret key; a missing key is recorded, never guessed around.
+    mark("webhooks", "workflows")
     if sandbox_secret_key:
         rw = Reader(sandbox_api_base, sandbox_secret_key)
+        rw.on_call = hook
         cap["workflows"], cap["workflows_source"] = read_workflows(rw)
+        # the event catalogue the creates will be validated against (sandbox-wide)
+        mark("webhooks", "event_types")
+        cap["workflow_event_types"] = read_event_types(rw) if cap["workflows"] else None
         r.calls += rw.calls
         r.errors.extend(rw.errors)
     else:
         cap["workflows"], cap["workflows_source"] = None, "no_key"
+        cap["workflow_event_types"] = None
 
     cap["_meta"] = {"calls": r.calls, "errors": r.errors}
     return cap
@@ -2130,7 +2255,13 @@ def build_plan(cap, target_client_name=None):
             return
         if not cap["entities"]:
             return
-        first_eid = cap["entities"][0]["id"]
+        # only scopes the catalogue knows; a missing one is noted rather than sent blind
+        sk_scopes = [s for s in WEBHOOK_SECRET_KEY_SCOPES if s in scopes["secret"]]
+        sk_notes = ["workflow scopes only, no entity assignment — the key exists to create "
+                    "the clone's webhooks; the returned temporary_secret is decrypted in-run"]
+        if len(sk_scopes) < len(WEBHOOK_SECRET_KEY_SCOPES):
+            missing = sorted(set(WEBHOOK_SECRET_KEY_SCOPES) - set(sk_scopes))
+            sk_notes.append(f"not in CAT's scope catalogue, so not requested: {', '.join(missing)}")
         add("client_public_crypto_key", "POST", f"/clients/{ph(src_cli)}/public-keys",
             {"name": public_crypto_key_name(), "type": "RSA",
              "key": PUBLIC_KEY_PEM_MARKER},
@@ -2142,15 +2273,16 @@ def build_plan(cap, target_client_name=None):
         add("client_api_secret_key", "POST",
             f"/clients/{ph(src_cli)}/standalone-reference-tokens",
             {"description": API_KEY_DESCRIPTIONS["client_api_secret_key"],
-             "scopes": list(scopes["secret"]),
+             "scopes": sk_scopes,
              "public_key_id": ph(PUBLIC_CRYPTO_KEY_PROVIDES),
-             "entity_id": ph(first_eid), "allow_any_processing_channel": True,
+             # No entity: see WEBHOOK_SECRET_KEY_SCOPES. (With ALL secret scopes an empty
+             # entity_id 503'd — several of those scopes are entity-bound; the workflow
+             # scopes are not.)
+             "entity_id": "", "allow_any_processing_channel": True,
              "processing_channel_ids": []},
-            requires=[src_cli, PUBLIC_CRYPTO_KEY_PROVIDES, first_eid],
+            requires=[src_cli, PUBLIC_CRYPTO_KEY_PROVIDES],
             op="StandaloneReferenceTokens_Create", optional=True,
-            label=API_KEY_DESCRIPTIONS["client_api_secret_key"],
-            notes=[f"{len(scopes['secret'])} secret-side scopes; the returned "
-                   f"temporary_secret is decrypted in-run and used for the webhook steps"])
+            label=API_KEY_DESCRIPTIONS["client_api_secret_key"], notes=sk_notes)
         add("client_api_public_key", "POST",
             f"/clients/{ph(src_cli)}/standalone-reference-tokens",
             {"description": API_KEY_DESCRIPTIONS["client_api_public_key"],
@@ -2197,10 +2329,27 @@ def build_plan(cap, target_client_name=None):
         ent_ids = {e["id"] for e in cap["entities"]}
         ch_ids = {c["id"] for e in cap["entities"]
                   for c in (e.get("processing_channels") or []) if c.get("id")}
+        event_types = cap.get("workflow_event_types")
+        if event_types is None and wfs:
+            flag(make_flag(
+                "webhook_events_not_checked",
+                "webhooks: the event-type catalogue (/workflows/event-types) could not be "
+                "read, so event conditions were not validated — a workflow naming an event "
+                "the platform has retired will be refused with condition_event_types_invalid",
+                kind="client", object_id=src_cli, action="not_checked"))
         expected = []
         for wf in wfs:
             name = wf.get("name") or wf.get("id") or "unnamed workflow"
-            body, req, notes, emptied = workflow_create_body(wf, ent_ids, ch_ids)
+            body, req, notes, emptied, dropped_events = workflow_create_body(
+                wf, ent_ids, ch_ids, event_types)
+            for source, ev in dropped_events:
+                # Flagged, not fatal: the workflow is still created without the event.
+                flag(make_flag(
+                    "webhook_event_dropped",
+                    f"webhook workflow '{name}' will still be created, but {source}."
+                    f"{ev} is no longer an event type on the platform and is left out",
+                    kind="webhook_workflow", object_id=wf.get("id"), source=source,
+                    event=ev, action="dropped"))
             if emptied:
                 skipped.append({"kind": "webhook_workflow",
                                 "reason": f"workflow '{name}': every id in its {emptied} "
@@ -2220,6 +2369,9 @@ def build_plan(cap, target_client_name=None):
                         f"key. Confirm that is the intended endpoint for the clone.",
                         kind="webhook_workflow", object_id=wf.get("id"), url=a["url"],
                         action="carried"))
+            # No retry: 5 x 20s on condition_entity_entity_id_invalid changed nothing (run
+            # 2026-09-08T15:48Z), so it is not propagation — it was the secret key's entity
+            # assignment (see WEBHOOK_SECRET_KEY_SCOPES).
             add("webhook_workflow", "POST", "/workflows", body, requires=req,
                 op="Workflows_Add", notes=notes, label=name, optional=True,
                 auth="sandbox_secret")

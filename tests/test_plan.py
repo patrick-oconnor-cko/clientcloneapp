@@ -2203,7 +2203,9 @@ class TestWebhooks(unittest.TestCase):
     # -- plan side ---------------------------------------------------------------
     def test_create_body_strips_every_server_id_and_remaps_scope_ids(self):
         wf = self.cap["workflows"][0]
-        body, req, notes, emptied = cc.workflow_create_body(wf, {self.eid}, {self.pcid})
+        body, req, notes, emptied, dropped_events = cc.workflow_create_body(
+            wf, {self.eid}, {self.pcid}, self.cap["workflow_event_types"])
+        self.assertEqual(dropped_events, [])
         blob = json.dumps(body)
         for prefix in ("wf_", "wfc_", "wfa_", "_links", "created_at", "updated_at"):
             self.assertNotIn(prefix, blob, prefix)
@@ -2229,7 +2231,7 @@ class TestWebhooks(unittest.TestCase):
 
     def test_a_workflow_scoped_only_outside_the_capture_is_skipped_and_flagged(self):
         wf = self.cap["workflows"][1]
-        body, req, notes, emptied = cc.workflow_create_body(wf, {self.eid}, {self.pcid})
+        body, req, notes, emptied, _ = cc.workflow_create_body(wf, {self.eid}, {self.pcid})
         self.assertEqual(emptied, "entity")
         hooks = steps_of(self.plan, "webhook_workflow")
         self.assertEqual([s["label"] for s in hooks], ["Payments webhook"])
@@ -2260,6 +2262,76 @@ class TestWebhooks(unittest.TestCase):
         self.assertTrue(all(s["auth"] is None for s in self.plan["steps"]
                             if not s["kind"].startswith("webhook")))
 
+    def test_read_event_types_maps_sources_to_event_ids(self):
+        class R:
+            def get(self, path):
+                assert path == "/workflows/event-types"
+                return [{"id": "gateway", "display_name": "Gateway", "description": "",
+                         "events": [{"id": "payment_approved"}, {"id": "payment_declined"}]},
+                        {"id": "dispute", "events": [{"id": "dispute_won"}]},
+                        {"id": "empty", "events": []}], 200
+        self.assertEqual(cc.read_event_types(R()),
+                         {"gateway": ["payment_approved", "payment_declined"],
+                          "dispute": ["dispute_won"], "empty": []})
+        class Refused:
+            def get(self, path): return {}, 401
+        self.assertIsNone(cc.read_event_types(Refused()))
+
+    def test_a_retired_event_is_left_out_and_flagged_but_the_webhook_is_still_created(self):
+        # First live webhook run: 'Capture test' named gateway.payment_authorized, which the
+        # platform no longer offers, and the create refused the whole workflow with
+        # condition_event_types_invalid. The plan must drop that event, keep the rest, and
+        # say so in the "will still be created" form.
+        plan = plan_for(fx.webhooks_with_retired_event_capture())
+        stale = next(s for s in steps_of(plan, "webhook_workflow") if s["label"] == "Capture test")
+        ev = next(c for c in stale["body"]["conditions"] if c["type"] == "event")
+        self.assertEqual(ev["events"], {"gateway": ["payment_authentication_failed", "payment_captured"],
+                                        "sessions": ["authentication_approved"]})
+        self.assertTrue(any("payment_authorized" in n for n in stale["notes"]))
+        fl = [f for f in plan["flags"] if f["code"] == "webhook_event_dropped"]
+        self.assertEqual(sorted((f["source"], f["event"]) for f in fl if "Capture test" in f["message"]),
+                         [("gateway", "payment_authorized"), ("sessions", "error_details")])
+        for f in fl:
+            self.assertEqual(f["action"], "dropped")
+            self.assertIn("will still be created", f["message"])
+        # a workflow left with no valid event at all is skipped, not sent empty
+        self.assertEqual([s["label"] for s in steps_of(plan, "webhook_workflow") if s["label"] == "Legacy only"], [])
+        self.assertTrue(any(x["code"] == "webhook_scope_emptied" and "Legacy only" in x["message"]
+                            for x in plan["flags"]))
+        self.assertFalse(any(x["code"] == "webhook_events_not_checked" for x in plan["flags"]))
+
+    def test_without_the_catalogue_events_pass_through_and_the_plan_says_so(self):
+        cap = fx.webhooks_with_retired_event_capture()
+        cap["workflow_event_types"] = None
+        plan = plan_for(cap)
+        stale = next(s for s in steps_of(plan, "webhook_workflow") if s["label"] == "Capture test")
+        ev = next(c for c in stale["body"]["conditions"] if c["type"] == "event")
+        self.assertIn("payment_authorized", ev["events"]["gateway"])       # not filtered
+        codes = [x["code"] for x in plan["flags"]]
+        self.assertEqual(codes.count("webhook_events_not_checked"), 1)
+        self.assertNotIn("webhook_event_dropped", codes)
+
+    def test_capture_reads_the_event_catalogue_only_when_it_read_workflows(self):
+        seen = []
+        class FakeReader:
+            def __init__(self, base, token): self.calls = 0; self.errors = []; self.on_call = None
+            def get(self, path):
+                self.calls += 1; seen.append(path)
+                if path == "/workflows": return {"data": [{"id": "wf_1", "name": "n", "active": True}]}, 200
+                if path == "/workflows/wf_1": return {"id": "wf_1", "name": "n", "active": True, "conditions": [], "actions": []}, 200
+                if path == "/workflows/event-types": return [{"id": "gateway", "events": [{"id": "payment_approved"}]}], 200
+                return ({}, 200) if "clients" in path or "entities" in path else ({}, 404)
+            def hal(self, path, key): return [], 200
+        with mock.patch.object(cc, "Reader", FakeReader):
+            cap = cc.capture("https://cat", "cat-tok", fx.SOURCE_CLIENT, sandbox_secret_key=self.SRC_SK)
+        self.assertEqual(cap["workflow_event_types"], {"gateway": ["payment_approved"]})
+        self.assertIn("/workflows/event-types", seen)
+        seen.clear()
+        with mock.patch.object(cc, "Reader", FakeReader):
+            cap = cc.capture("https://cat", "cat-tok", fx.SOURCE_CLIENT)      # no key
+        self.assertIsNone(cap["workflow_event_types"])
+        self.assertNotIn("/workflows/event-types", seen)
+
     def test_the_receiver_url_is_flagged_for_confirmation(self):
         f = [x for x in self.plan["flags"] if x["code"] == "webhook_url_carried"]
         self.assertEqual(len(f), 1)
@@ -2281,19 +2353,42 @@ class TestWebhooks(unittest.TestCase):
         self.assertEqual(len(f), 1); self.assertEqual(f[0]["errors"][0]["code"], 401)
 
     # -- apply side --------------------------------------------------------------
-    def test_without_the_destination_key_webhooks_block_and_the_clone_still_completes(self):
+    def test_without_a_destination_key_or_minting_webhooks_block_and_the_clone_still_completes(self):
+        plan = plan_for(fx.webhooks_without_key_minting_capture())   # no key steps at all
         with NoSocket():
-            run = capp.apply_plan(self.plan)          # dry run, no keys at all
+            run = capp.apply_plan(plan)               # dry run, no keys pasted either
         hooks = [e for e in run["journal"] if e["kind"].startswith("webhook")]
         self.assertEqual(len(hooks), 2)
         for e in hooks:
             self.assertEqual(e["status"], "blocked")
             self.assertIn("Destination Sandbox Secret Key", e["error"])
             self.assertEqual(e["flags"][0]["code"], "optional_step_blocked")
-        cat_steps = len(self.plan["steps"]) - 2
+        cat_steps = len(plan["steps"]) - 2
         self.assertEqual(run["counts"], {"steps": cat_steps + 2, "created": cat_steps,
                                          "failed": 2, "not_attempted": 0})
         self.assertEqual([f["code"] for f in run["flags"]], ["optional_step_blocked"] * 2)
+
+    def test_dry_run_models_the_key_minted_earlier_in_the_run(self):
+        # The plan mints the destination secret key before the webhooks, so a dry run with
+        # nothing pasted must show the webhook steps RESOLVED and say where the key comes
+        # from — not "supply it in the side panel" (that is what the first live dry run said).
+        with NoSocket():
+            run = capp.apply_plan(self.plan)
+        sk = next(e for e in run["journal"] if e["kind"] == "client_api_secret_key")
+        self.assertEqual(sk["would_mint"], "sandbox_secret")
+        for e in (x for x in run["journal"] if x["kind"].startswith("webhook")):
+            self.assertEqual(e["status"], "dry-run", e)
+            self.assertEqual(e["auth_source"], f"key minted at step {sk['seq']}")
+        self.assertEqual(run["counts"]["failed"], 0)
+        self.assertEqual(run["destination_keys"], {})          # nothing real was minted
+        # a pasted key wins over the modelled one, as it does live
+        pasted = "sk_sbox_" + "p" * 26
+        with NoSocket():
+            run = capp.apply_plan(self.plan, sandbox_keys={"sandbox_secret": pasted})
+        sk = next(e for e in run["journal"] if e["kind"] == "client_api_secret_key")
+        self.assertNotIn("would_mint", sk)
+        hook = next(e for e in run["journal"] if e["kind"] == "webhook_workflow")
+        self.assertNotIn("auth_source", hook)
 
     def test_with_the_destination_key_the_dry_run_resolves_every_placeholder(self):
         with NoSocket():
@@ -2328,6 +2423,57 @@ class TestWebhooks(unittest.TestCase):
         self.assertEqual(run["counts"]["failed"], 0)
         self.assertFalse(any(f["code"] == "webhook_missing_on_clone" for f in run["flags"]))
         self.assertNotIn(self.SRC_SK, json.dumps(run)); self.assertNotIn(self.DEST_SK, json.dumps(run))
+
+    def test_a_retry_limited_to_one_error_ignores_every_other(self):
+        # Webhook creates carry NO retry any more (5 x 20s on the entity error changed
+        # nothing live), but the gated-retry mechanism stays: exercise it by giving the
+        # webhook step a retry limited to one error code.
+        import copy
+        plan = copy.deepcopy(self.plan)
+        for s in plan["steps"]:
+            if s["kind"] == "webhook_workflow":
+                s["retry"] = {"attempts": 5, "delay_seconds": 20,
+                              "when_error_contains": "condition_entity_entity_id_invalid"}
+        self.assertIsNone(steps_of(self.plan, "webhook_workflow")[0]["retry"])
+        # live: the matching error is retried until it clears; any other 4xx is not
+        calls = {"n": 0}
+        def flaky(base, bearer, method, path, body=None, **kw):
+            if path == "/workflows" and method == "POST":
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    return {}, 422, '{"error_codes":["condition_entity_entity_id_invalid"]}'
+                return {"id": "wf_new"}, 201, None
+            if path == "/workflows":
+                return {"data": [{"name": "Payments webhook"}]}, 200, None
+            return {"id": "x_" + str(len(path))}, 201, None
+        slept = []
+        with mock.patch.object(capp, "_send", side_effect=flaky), \
+             mock.patch("time.sleep", lambda s, *a, **k: slept.append(s)):
+            run = capp.apply_plan(plan, base="https://cat", token="cat-token",
+                                  dry_run=False, pace_seconds=0,
+                                  sandbox_keys={"sandbox_secret": self.DEST_SK})
+        e = next(x for x in run["journal"] if x["kind"] == "webhook_workflow")
+        self.assertEqual((e["status"], e["attempts"]), (201, 3))
+        self.assertEqual(slept.count(20), 2)
+        self.assertEqual(run["counts"]["failed"], 0)
+        # a different rejection is NOT retried
+        def hard(base, bearer, method, path, body=None, **kw):
+            if path == "/workflows" and method == "POST":
+                calls["n"] += 1
+                return {}, 422, '{"error_codes":["url_invalid"]}'
+            if path == "/workflows":
+                return {"data": []}, 200, None
+            return {"id": "x_" + str(len(path))}, 201, None
+        calls["n"] = 0; slept.clear()
+        with mock.patch.object(capp, "_send", side_effect=hard), \
+             mock.patch("time.sleep", lambda s, *a, **k: slept.append(s)):
+            run = capp.apply_plan(plan, base="https://cat", token="cat-token",
+                                  dry_run=False, pace_seconds=0,
+                                  sandbox_keys={"sandbox_secret": self.DEST_SK})
+        self.assertEqual(calls["n"], 1)
+        self.assertNotIn(20, slept)
+        e = next(x for x in run["journal"] if x["kind"] == "webhook_workflow")
+        self.assertEqual((e["status"], e["attempts"]), (422, 1))
 
     def test_read_back_does_not_report_a_webhook_whose_own_create_failed(self):
         # First live run: four creates 422'd, then the read-back flagged all four as
@@ -2418,14 +2564,25 @@ class TestDestinationApiKeys(unittest.TestCase):
         self.assertRegex(pk["body"]["name"], r"^PUB KEY CAT SETUP \d{5}$")
         self.assertEqual(pk["provides"], cc.PUBLIC_CRYPTO_KEY_PROVIDES)
         self.assertTrue(pk["path"].endswith("/public-keys"))
-        for s, side, desc in ((sk, "secret", "CAT SETUP SECRET"), (pub, "public", "CAT SET UP PUB")):
+        for s, desc in ((sk, "CAT SETUP SECRET"), (pub, "CAT SET UP PUB")):
             self.assertTrue(s["path"].endswith("/standalone-reference-tokens"))
             self.assertEqual(s["body"]["description"], desc)
-            self.assertEqual(s["body"]["scopes"], fx.reference_capture()["api_key_scopes"][side])
             self.assertEqual(s["body"]["public_key_id"], cc.ph(cc.PUBLIC_CRYPTO_KEY_PROVIDES))
             self.assertEqual((s["body"]["allow_any_processing_channel"], s["body"]["processing_channel_ids"]), (True, []))
-        self.assertEqual(sk["body"]["entity_id"], cc.ph(fx.reference_capture()["entities"][0]["id"]))
-        self.assertEqual(pub["body"]["entity_id"], "")
+            # NEITHER key is assigned to an entity: an entity-assigned secret key cannot
+            # create a workflow naming another entity (four live runs, 2026-09-08)
+            self.assertEqual(s["body"]["entity_id"], "")
+            self.assertNotIn(fx.reference_capture()["entities"][0]["id"], json.dumps(s))
+        # the secret key carries ONLY the workflow scopes; the public key every public one
+        self.assertEqual(sk["body"]["scopes"], ["flow", "flow:workflows", "flow:events", "notifier:workflows"])
+        self.assertEqual(pub["body"]["scopes"], fx.reference_capture()["api_key_scopes"]["public"])
+
+    def test_a_workflow_scope_missing_from_the_catalogue_is_noted_not_sent(self):
+        cap = fx.reference_capture()
+        cap["api_key_scopes"]["secret"].remove("flow:events")
+        sk = steps_of(plan_for(cap), "client_api_secret_key")[0]
+        self.assertEqual(sk["body"]["scopes"], ["flow", "flow:workflows", "notifier:workflows"])
+        self.assertTrue(any("flow:events" in n for n in sk["notes"]))
         # the marker is not a placeholder: validate_plan and unresolved() must ignore it
         self.assertEqual([p for p in cc.validate_plan(self.plan) if not p.startswith("warning:")], [])
 
@@ -2525,6 +2682,180 @@ class TestDestinationApiKeys(unittest.TestCase):
         self.assertEqual([s for s in state["sent"] if s[3] == "/workflows"], [])
         self.assertEqual(run["destination_keys"], {})
         self.assertEqual(run["counts"]["failed"], 2)                 # only the two webhook steps
+
+
+class TestCaptureProgress(unittest.TestCase):
+    """The capture bar shows what has been READ: Reader fires a hook per completed read,
+    capture() stamps it with the phase, the server stores it under the page's run_id."""
+
+    SRC_SK = "sk_sbox_" + "s" * 32
+
+    class FakeResponse:
+        def __init__(self, status, body):
+            self.status, self._b = status, body
+        def read(self): return self._b
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def test_reader_fires_on_call_with_path_code_and_count(self):
+        import urllib.error
+        seen, r = [], cc.Reader("https://x", "tok")
+        r.on_call = lambda path, code, n: seen.append((path, code, n))
+        answers = [self.FakeResponse(200, b'{"a": 1}'),
+                   urllib.error.HTTPError("https://x/p2", 401, "nope", {}, None)]
+        def fake_open(req, timeout=30):
+            a = answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        with mock.patch("urllib.request.urlopen", side_effect=fake_open):
+            self.assertEqual(r.get("/p1"), ({"a": 1}, 200))
+            self.assertEqual(r.get("/p2"), ({}, 401))
+        self.assertEqual(seen, [("/p1", 200, 1), ("/p2", 401, 2)])
+        self.assertEqual(r.errors, [{"path": "/p2", "code": 401}])   # unchanged behaviour
+
+    def test_a_failing_hook_cannot_affect_a_read(self):
+        r = cc.Reader("https://x", "tok")
+        def boom(*a): raise RuntimeError("listener died")
+        r.on_call = boom
+        with mock.patch("urllib.request.urlopen", return_value=self.FakeResponse(200, b'{"ok": true}')):
+            self.assertEqual(r.get("/p"), ({"ok": True}, 200))
+        self.assertEqual(r.calls, 1)
+
+    # -- a Reader that answers capture()'s reads from the fixture ------------------------
+    @classmethod
+    def seam_reader(cls, cap):
+        import re
+        routes, cid = {}, cap["client_id"]
+        hal = lambda key, items: {"_embedded": {key: items}}
+        routes[f"/clients/{cid}"] = cap["client"]
+        for k in ("risk_settings", "compass_settings", "flow_account"):
+            routes[f"/clients/{cid}/{k.replace('_', '-')}"] = cap[k]
+        routes[f"/clients/{cid}/network-tokens"] = cap["network_tokens"]
+        routes[f"/clients/{cid}/entities?limit=25&skip=0"] = hal("entities", [
+            {"id": e["id"], "name": e["detail"].get("name")} for e in cap["entities"]])
+        for e in cap["entities"]:
+            eid = e["id"]
+            routes[f"/entities/{eid}"] = e["detail"]
+            routes[f"/entities/{eid}/currency-accounts?limit=25&skip=0"] = hal("currency_accounts", e["currency_accounts"])
+            routes[f"/entities/{eid}/processing-profiles?limit=25&skip=0"] = hal("processing_profiles", [{"id": p["id"]} for p in e["processing_profiles"]])
+            for p in e["processing_profiles"]:
+                routes[f"/processing-profiles/v2/{p['id']}"] = p["detail"]
+            routes[f"/entities/{eid}/processing-channels?limit=25&skip=0"] = hal("processing_channels", [{"id": c["id"]} for c in e["processing_channels"]])
+            for c in e["processing_channels"]:
+                routes[f"/processing-channels/{c['id']}"] = {**c["detail"], "processors": [{"id": pr["id"]} for pr in c["processors"]]}
+                for pr in c["processors"]:
+                    routes[f"/processing-channels/{c['id']}/processors/{pr['id']}"] = pr
+            routes[f"/entities/{eid}/sessions-processing-channels?limit=25&skip=0"] = hal("sessions_processing_channels", [{"id": s["id"]} for s in e["sessions_channels"]])
+            for s in e["sessions_channels"]:
+                routes[f"/sessions-processing-channels/{s['id']}"] = s
+            for kind, seg in (("payment_routing", "payment-routing-rules"), ("payout_routing", "payout-routing-rules")):
+                routes[f"/entities/{eid}/{seg}?limit=25&skip=0"] = hal("routing_rules", [{"id": x["id"]} for x in e[kind]])
+                for x in e[kind]:
+                    routes[f"/{seg}/{x['id']}"] = x
+            pset = [{**s, "id": s.get("id") or f"ps{i}"} for i, s in enumerate(e["payout_settings"])]
+            routes[f"/entities/{eid}/payout-settings?limit=25&skip=0"] = hal("payout_settings", [{"id": s["id"]} for s in pset])
+            for s in pset:
+                routes[f"/entities/{eid}/payout-settings/{s['id']}"] = s
+            routes[f"/entities/{eid}/payout-routes?enabled=true"] = hal("data", e["payout_routes"])
+        routes[f"/access-keys/configuration?clientId={cid}"] = {"scopes": [
+            {"value": s, "label": s, "side_label": side}
+            for side in ("secret", "public") for s in cap["api_key_scopes"][side]]}
+        routes["/workflows"] = {"data": [{"id": w["id"], "name": w["name"], "active": w["active"]} for w in cap["workflows"]]}
+        for w in cap["workflows"]:
+            routes[f"/workflows/{w['id']}"] = w
+        routes["/workflows/event-types"] = [{"id": src, "display_name": src, "description": "",
+                                             "events": [{"id": e} for e in evs]}
+                                            for src, evs in (cap.get("workflow_event_types") or {}).items()]
+
+        class SeamReader(cc.Reader):
+            def _fetch(self, path):
+                if path in routes:
+                    return json.loads(json.dumps(routes[path])), 200
+                self.errors.append({"path": path, "code": 404})
+                return {}, 404
+        return SeamReader
+
+    CAT_TOKEN = "eyJ-cat-bearer-never-in-progress"
+
+    def _capture(self, cap, listener):
+        with mock.patch.object(cc, "Reader", self.seam_reader(cap)):
+            return cc.capture("https://cat", self.CAT_TOKEN, cap["client_id"],
+                              sandbox_secret_key=self.SRC_SK, on_progress=listener)
+
+    def test_capture_stamps_every_read_with_its_phase_in_order(self):
+        fixture = fx.webhooks_capture()
+        seen = []
+        cap = self._capture(fixture, seen.append)
+        # every read, across all three readers, exactly once and in order
+        self.assertEqual([e["seq"] for e in seen], list(range(1, len(seen) + 1)))
+        self.assertEqual(len(seen), cap["_meta"]["calls"])
+        order = [k for i, k in enumerate(e["kind"] for e in seen) if i == 0 or k != [e["kind"] for e in seen][i - 1]]
+        self.assertEqual(order, ["client", "entities", "entity", "validity", "api_key_scopes", "webhooks"])
+        n_ent = len(fixture["entities"])
+        listed = False
+        for e in seen:
+            self.assertEqual(set(e), {"seq", "kind", "sub", "entity_index", "entity_total", "method", "path", "status"})
+            self.assertEqual(e["method"], "GET")
+            if e["kind"] == "entities":
+                listed = True
+            if e["kind"] in ("entity", "validity", "api_key_scopes", "webhooks"):
+                self.assertEqual(e["entity_total"], n_ent, e)
+            if e["kind"] == "entity":
+                self.assertIn(e["sub"], cc.CAPTURE_ENTITY_SUBS, e)
+                self.assertTrue(1 <= e["entity_index"] <= n_ent, e)
+            if e["kind"] == "client":
+                self.assertIsNone(e["entity_total"])
+        self.assertTrue(listed)
+        self.assertEqual(sorted({e["entity_index"] for e in seen if e["kind"] == "entity"}), list(range(1, n_ent + 1)))
+        subs_seen = [e["sub"] for e in seen if e["kind"] == "entity" and e["entity_index"] == 1]
+        self.assertEqual([s for i, s in enumerate(subs_seen) if i == 0 or s != subs_seen[i - 1]],
+                         list(cc.CAPTURE_ENTITY_SUBS))
+        self.assertTrue(any(e["kind"] == "webhooks" and e["path"].startswith("/workflows") for e in seen))
+        blob = json.dumps(seen)
+        self.assertNotIn(self.CAT_TOKEN, blob); self.assertNotIn(self.SRC_SK, blob)
+
+    def test_the_capture_is_identical_with_and_without_a_listener(self):
+        fixture = fx.webhooks_capture()
+        a = self._capture(fixture, None)
+        b = self._capture(fixture, lambda e: None)
+        self.assertEqual(a, b)
+        self.assertEqual(len(a["entities"]), len(fixture["entities"]))
+        self.assertEqual(a["workflows_source"], "sandbox-api")
+
+    def test_capture_handler_registers_progress_under_the_pages_run_id(self):
+        def fake_capture(base, token, client_id, **kw):
+            kw["on_progress"]({"seq": 1, "kind": "client", "sub": "client", "entity_index": None,
+                               "entity_total": None, "method": "GET", "path": "/clients/x",
+                               "status": 200, "token": "never"})
+            mid = server.clone_progress_handler({"run_id": "cap-page-7"})
+            self.assertEqual((mid["done"], mid["total"], mid["kind"], len(mid["entries"])),
+                             (False, None, "capture", 1))
+            self.assertEqual(mid["entries"][0]["sub"], "client")
+            self.assertNotIn("token", mid["entries"][0])
+            return fx.reference_capture()
+        with mock.patch.object(server.cc, "capture", side_effect=fake_capture), \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()), NoSocket():
+            out = server.clone_capture_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t",
+                                                "run_id": "cap-page-7"})
+        self.assertIn("plan", out)
+        self.assertEqual(out["run_id"], "cap-page-7")
+        self.assertTrue(server.clone_progress_handler({"run_id": "cap-page-7"})["done"])
+
+    def test_capture_progress_is_marked_done_even_when_capture_raises(self):
+        with mock.patch.object(server.cc, "capture", side_effect=RuntimeError("cat down")), \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()):
+            with self.assertRaises(RuntimeError):
+                server.clone_capture_handler({"client_id": fx.SOURCE_CLIENT, "cat_token": "t",
+                                              "run_id": "cap-page-8"})
+        self.assertTrue(server.clone_progress_handler({"run_id": "cap-page-8"})["done"])
+
+    def test_progress_store_records_the_kind_and_an_unknown_total(self):
+        server.progress_start("cap-test-1", None, kind="capture")
+        out = server.clone_progress_handler({"run_id": "cap-test-1"})
+        self.assertEqual((out["kind"], out["total"]), ("capture", None))
+        server.progress_start("run-test-2", 5)
+        self.assertEqual(server.clone_progress_handler({"run_id": "run-test-2"})["kind"], "apply")
 
 
 class TestLiveProgress(unittest.TestCase):
