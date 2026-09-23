@@ -72,8 +72,8 @@ Python **3.9+** and nothing else — pure standard library. No dependencies to i
 ### Tests
 
 ```bash
-python3 tests/test_plan.py        # 296 tests, well under a second
-python3 tests/mutation_check.py   # 143 mutants — proves those tests have teeth
+python3 tests/test_plan.py        # 303 tests, well under a second
+python3 tests/mutation_check.py   # 146 mutants — proves those tests have teeth
 ```
 
 No token, no network, no writes. The suite asserts on the plan document and on a dry run:
@@ -300,6 +300,58 @@ clone's key read back), and `region_required` (a workflow with `aws` actions →
 action allowlist). The latest run created **115 of 116 steps**, with both webhook workflows
 read back on the clone. Still open (TODO §00.5): BIN validation, a prod NT-portal host, and
 a manual-values form on the Apply page for the blocked payout-setting step.
+
+---
+
+## Deploying to the CKO AI Sandbox
+
+The dashboard upload builds a Docker image in CodeBuild from a `Dockerfile` at the zip root
+("Option 2" of the packaging guide). Option 1 — let the platform generate the Dockerfile —
+does not apply: the app is pure standard library, so there is no `requirements.txt` for it
+to recognise. The `index.html` warning the dashboard shows is a static-site heuristic; the
+real health check is `GET /` → 200, which the server already satisfies by serving the page.
+
+Everything the platform needs is driven by environment variables, and local behaviour is
+unchanged when they are unset:
+
+| Variable | Container | Local default | Effect |
+|---|---|---|---|
+| `HOST` | `0.0.0.0` | `127.0.0.1` | bind address — loopback only unless told otherwise |
+| `CLONE_PORT` (or `PORT`) | `3000` | `8788` | listening port (platform rule: 3000) |
+| `CLONE_RUNS_DIR` | `/data/clone-runs` | `<repo>/clone-runs` | journals and captures; `/data` is the durable mount |
+| `PUBLIC_URL` | set by the platform | unset | the hosted URL; becomes the Okta `redirect_uri` |
+
+Build the upload from the repo root. The exclusions matter: `app/dev-creds.local.json`
+holds your sandbox keys and `clone-runs/` holds real client data, and `.dockerignore` runs
+too late to protect the zip itself.
+
+```bash
+cd /Users/patrick.oconnor/ckocloneclient && zip -r ../ckocloneclient.zip . \
+  -x '.git/*' '.claude/*' 'clone-runs/*' 'cat-api/*' '*.local.json' '*/__pycache__/*' '.DS_Store'
+```
+
+Check before uploading: `unzip -l ../ckocloneclient.zip | grep -c 'local.json'` must print
+`0`, and `Dockerfile` must be listed at the root.
+
+**First check on a hosted instance:** open `<hosted-url>/api/health`. It is token-free and
+read-only, and reports in three seconds whether the server can resolve and connect to each
+CAT host (`reach.cat_sandbox.tcp443` must be `ok` for a capture to work). The page shows the
+same line under the status area on load. The first deployment (2026-09-23) reached the page
+but every CAT call timed out — the container was not on a network that can see CAT — and
+before this check that surfaced only as a silent 30-second hang, because the page used to
+swallow non-JSON responses.
+
+Three things the platform cannot fix for you:
+
+- **Okta sign-in** needs the hosted URL registered as a login redirect URI on both Okta
+  apps, exactly as `http://localhost:8788/` does today. Until then, paste a token.
+- **The CAT hosts are VPN-only.** Whether the sandbox's containers can reach
+  `client-admin.cko-sbox.ckotech.co` is a network question; if not, every capture ends with
+  the "could not reach" message and the token is never evaluated.
+- **The server has no authentication of its own.** Locally it is loopback-only. Hosted,
+  anyone who can reach the URL can run a live apply with their own CAT token and will be
+  shown the destination keys the run mints. Only deploy where the network is restricted to
+  CKO staff.
 
 ---
 

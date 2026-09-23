@@ -8,8 +8,21 @@
   finished. That step has since been removed (see below); a plan built from the same
   capture now yields **86 steps, none optional**. 3-entity reference client
   `cli_scna7ew7mxdenl3h36zlmkyh6m`.
-- **Tests:** `python3 tests/test_plan.py` → 296 pass. `python3 tests/mutation_check.py` →
-  143/143 mutants caught.
+- **Tests:** `python3 tests/test_plan.py` → 303 pass. `python3 tests/mutation_check.py` →
+  146/146 mutants caught.
+- **Deployed to the CKO AI Sandbox (2026-09-23) — page loads, CAT unreachable.** Every CAT
+  call from the container times out (private VPN-only address, no egress). Needs the
+  platform team to allow 443 egress to `client-admin.cko-sbox.ckotech.co`,
+  `client-admin.cko-prod.ckotech.co`, `nt-portal.sbox.checkout.internal`,
+  `api.sandbox.checkout.com`, `api.checkout.com`. `GET /api/health` (token-free) now answers
+  this in 3 s; the page shows it on load; `post()` no longer swallows non-JSON/failed
+  responses (the original symptom was a silent hang).
+- **Packaged for the CKO AI Sandbox (2026-09-23), not yet deployed.** `Dockerfile` at the
+  root (pull-through python:3.12-slim, port 3000, `/data/clone-runs`), server env-driven
+  (`HOST`, `CLONE_PORT`/`PORT`, `CLONE_RUNS_DIR`, `PUBLIC_URL`). Zip command and the three
+  platform caveats (Okta redirect registration for the hosted URL, VPN reachability of CAT
+  from the sandbox, no auth of its own) in README *Deploying*. First upload's failure was
+  simply "No Dockerfile found in source".
 - **Prod → Sandbox built (2026-09-09); first live capture attempted.** Reads from
   `client-admin.cko-prod.ckotech.co` (the swagger's `client-admin-prod.ckotech.co` does not
   resolve — the first attempt's "HTTP 0" was a DNS failure, not a token problem) with a

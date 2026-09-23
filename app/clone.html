@@ -126,6 +126,7 @@
     <div class="hint">Read-only. Reads the source client and builds a clone plan.
       Nothing is created at this step.</div>
     <div class="hint" id="status"></div>
+    <div class="hint mut" id="health"></div>
     <div id="capprog"></div>
   </div>
 
@@ -219,10 +220,38 @@ function wireConfirm(boxId,btnId,word){
   if(cb&&btn) cb.oninput=()=>{btn.disabled=cb.value.trim()!==word;};
 }
 
+// Never throws, never hides a response. A proxy in front of a hosted instance can answer
+// with an HTML error page or a gateway timeout, and a dropped connection rejects the fetch;
+// either used to vanish into a handler with no catch and the page sat on "Loading…". Every
+// handler already branches on body.error, so returning the failure as one reports it.
 async function post(path,body){
-  const r=await fetch(API_BASE+path,{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(body)});
-  return {code:r.status, body:await r.json()};
+  const t0=performance.now();
+  let r;
+  try{
+    r=await fetch(API_BASE+path,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body)});
+  }catch(e){
+    return {code:0, body:{error:`could not reach the server at ${API_BASE}${path} after ${fmtDur(performance.now()-t0)}: ${e&&e.message||e}`}};
+  }
+  const text=await r.text();
+  try{ return {code:r.status, body:JSON.parse(text)}; }
+  catch(e){
+    const el=performance.now()-t0;
+    return {code:r.status, body:{error:`HTTP ${r.status} after ${fmtDur(el)} — the server (or the proxy in front of it) returned a non-JSON response`
+      +(el>10000?" (a timeout: the server was probably still waiting on CAT)":"")
+      +`: ${text.replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim().slice(0,200)||"(empty body)"}`}};
+  }
+}
+// Token-free reachability line on load: can THIS server see CAT? (GET /api/health)
+async function renderHealth(){
+  const el=$("health"); if(!el) return;
+  try{
+    const r=await fetch(API_BASE+"/api/health"); const h=await r.json();
+    const s=h.reach.cat_sandbox, p=h.reach.cat_prod;
+    const one=(x)=>x.tcp443==="ok"?`<span class="ok">reachable</span>`:`<span class="err">unreachable — ${esc(x.dns.startsWith("error")?x.dns:x.tcp443)}</span>`;
+    el.innerHTML=`server ok${h.public_url?` at ${esc(h.public_url)}`:""} · CAT sandbox: ${one(s)} · CAT prod: ${one(p)}`
+      +(h.can_capture_sandbox?"":` · <span class="err">captures cannot work from here until this server can reach CAT (VPN / network egress)</span>`);
+  }catch(e){ el.innerHTML=`<span class="err">server health check failed: ${esc(e&&e.message||e)}</span>`; }
 }
 
 // Credentials travel with every request and live only for its duration. The CAT token is
@@ -1280,6 +1309,7 @@ $("okta_src").onclick=()=>startOktaLogin("prod");
 $("cat_token").addEventListener("input",tokenStatus);
 $("src_cat_token").addEventListener("input",tokenStatus);
 finishOktaLogin();                 // returning from Okta? pick the token out of the fragment
+renderHealth();                    // can this server reach CAT at all?
 refreshModeUI(); setInterval(tokenStatus,60000);
 showTab(0);
 </script>

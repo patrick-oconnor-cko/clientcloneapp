@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Clone client — needs its server</title>
+<p style="font:14px system-ui;max-width:40em;margin:3em auto">
+This tool is served by <code>app/server.py</code> (Python, standard library only), which also
+answers the <code>/api/clone/…</code> calls the page makes. If you are reading this file, the
+folder was served as static files and nothing will work — deploy the <code>Dockerfile</code>
+at the repository root instead (it listens on port 3000 and serves the page at <code>/</code>).
+</p>

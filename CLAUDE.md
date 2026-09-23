@@ -45,6 +45,10 @@ that are expensive to rediscover.
   leaves a permanent record in sandbox. Prefer scoping a run to one entity.
 - **Never run a live apply or cleanup without being asked explicitly.** A dry run is always
   fine and needs no permission.
+- **The server binds loopback unless `HOST` is set and has no auth of its own.** The
+  `Dockerfile` (CKO AI Sandbox) sets `HOST=0.0.0.0`, port 3000, `/data/clone-runs` and
+  reads `PUBLIC_URL` for the Okta redirect. Never make it reachable from a network that is
+  not restricted to CKO staff; never bake keys or `*.local.json` into the image or the zip.
 - **Don't start the server yourself** — Patrick runs it. Give the command:
   `python3 app/server.py` (port 8788)
 - **Commit only when asked.** Work locally; don't prompt for it.

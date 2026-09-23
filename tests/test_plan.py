@@ -20,7 +20,7 @@ contract is right. Only a known-good live call settles that.
     python3 tests/test_plan.py
     python3 -m unittest discover -s tests
 """
-import json, pathlib, re, sys, unittest
+import json, os, pathlib, re, socket, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "app"))
@@ -128,6 +128,8 @@ class NoSocket:
         def boom(*a, **k):
             raise AssertionError("a socket was opened during a dry run")
         self._patches = [mock.patch("urllib.request.urlopen", boom),
+                         mock.patch("socket.create_connection", boom),
+                         mock.patch("socket.getaddrinfo", boom),
                          mock.patch("time.sleep", lambda *a, **k: None)]
         for p in self._patches:
             p.start()
@@ -3121,6 +3123,86 @@ class TestProdMode(unittest.TestCase):
         cap = fx.reference_capture()
         cap["_meta"]["truncated"] = r.truncated
         self.assertIn("list_truncated", {f["code"] for f in plan_for(cap)["flags"]})
+
+
+class TestDeployment(unittest.TestCase):
+    """Packaging for the CKO AI Sandbox (Dockerfile, port 3000, /data). Local behaviour is
+    unchanged when the environment variables are unset."""
+
+    ROOT = pathlib.Path(server.HERE).parent
+
+    def test_public_url_becomes_the_okta_redirect_when_hosted(self):
+        with mock.patch.object(server, "PUBLIC_URL", "https://clone.sandbox.example"):
+            self.assertEqual(server.okta_config()["redirect_uri"], "https://clone.sandbox.example/")
+        with mock.patch.object(server, "PUBLIC_URL", ""):
+            self.assertEqual(server.okta_config()["redirect_uri"], f"http://localhost:{server.PORT}/")
+
+    def test_local_defaults_are_loopback_and_the_repo_runs_dir(self):
+        # the test process has none of the deployment variables set
+        for var in ("HOST", "PUBLIC_URL", "CLONE_RUNS_DIR"):
+            self.assertIsNone(os.environ.get(var), var)
+        self.assertEqual(server.HOST, "127.0.0.1")
+        self.assertEqual(server.PUBLIC_URL, "")
+        self.assertEqual(pathlib.Path(server.RUNS_DIR).name, "clone-runs")
+
+    def test_dockerfile_follows_the_platform_rules(self):
+        d = (self.ROOT / "Dockerfile").read_text()
+        self.assertIn("FROM 891377407345.dkr.ecr.eu-west-1.amazonaws.com/cko-pull-through/docker-hub/library/python:", d)
+        self.assertIn("EXPOSE 3000", d)
+        self.assertIn("CLONE_PORT=3000", d)
+        self.assertIn("HOST=0.0.0.0", d)
+        self.assertIn("CLONE_RUNS_DIR=/data/clone-runs", d)
+        self.assertIn('CMD ["python3", "app/server.py"]', d)
+        self.assertNotIn("pip install", d)           # stdlib only
+        self.assertNotIn("PUBLIC_URL=", d)           # comes from the platform, not the image
+        ignore = (self.ROOT / ".dockerignore").read_text().split()
+        for entry in ("*.local.json", "clone-runs/", "cat-api/", ".git"):
+            self.assertIn(entry, ignore)
+
+
+class TestHealth(unittest.TestCase):
+    """GET /api/health: token-free, read-only — can this deployment reach CAT? The hosted
+    instance's first symptom was a silent hang; this answers in 3 s what a capture takes 30
+    to report. Nothing here opens a real socket."""
+
+    def _run(self, getaddrinfo, connect):
+        with mock.patch("socket.getaddrinfo", side_effect=getaddrinfo), \
+             mock.patch("socket.create_connection", side_effect=connect), \
+             mock.patch.object(server, "RUNS_DIR", _tmp_runs_dir()):
+            return server.health_handler()
+
+    def test_reachable_hosts_report_ok(self):
+        cm = mock.MagicMock(); cm.__enter__.return_value = cm
+        h = self._run(lambda host, *a, **k: [(None, None, None, None, ("10.0.0.1", 443))],
+                      lambda addr, timeout: cm)
+        self.assertTrue(h["ok"]); self.assertTrue(h["can_capture_sandbox"])
+        self.assertEqual(sorted(h["reach"]), ["cat_prod", "cat_sandbox", "nt_portal", "sandbox_api"])
+        self.assertEqual(h["reach"]["cat_sandbox"]["host"], "client-admin.cko-sbox.ckotech.co")
+        self.assertEqual(h["reach"]["cat_sandbox"]["tcp443"], "ok")
+        self.assertTrue(h["runs_dir_writable"])
+        self.assertEqual(h["bind"], f"{server.HOST}:{server.PORT}")
+
+    def test_a_black_holed_host_is_reported_not_hung(self):
+        h = self._run(lambda host, *a, **k: [(None, None, None, None, ("10.0.0.1", 443))],
+                      mock.Mock(side_effect=socket.timeout("timed out")))
+        self.assertFalse(h["can_capture_sandbox"])
+        self.assertIn("timeout", h["reach"]["cat_sandbox"]["tcp443"])
+        self.assertEqual(h["reach"]["cat_sandbox"]["dns"], "10.0.0.1")
+
+    def test_a_dns_failure_skips_the_connect(self):
+        h = self._run(mock.Mock(side_effect=socket.gaierror("nodename nor servname")),
+                      mock.Mock(side_effect=AssertionError("must not connect")))
+        self.assertTrue(h["reach"]["cat_sandbox"]["dns"].startswith("error"))
+        self.assertEqual(h["reach"]["cat_sandbox"]["tcp443"], "not attempted")
+
+    def test_the_page_never_swallows_a_failed_or_non_json_response(self):
+        html = (pathlib.Path(server.HERE) / "clone.html").read_text()
+        post_src = html[html.index("async function post("):html.index("async function renderHealth")]
+        self.assertNotIn("r.json()", post_src)
+        self.assertIn("JSON.parse(text)", post_src)
+        self.assertIn("could not reach the server", post_src)
+        self.assertIn("non-JSON response", post_src)
+        self.assertIn('fetch(API_BASE+"/api/health")', html)
 
 
 class TestOktaConfig(unittest.TestCase):

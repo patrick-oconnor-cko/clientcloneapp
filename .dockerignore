@@ -1,0 +1,11 @@
+.git
+.claude
+clone-runs/
+cat-api/
+tests/
+*.local.json
+__pycache__/
+*.pyc
+.DS_Store
+*.md
+index.html

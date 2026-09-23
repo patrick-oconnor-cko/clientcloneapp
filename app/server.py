@@ -15,7 +15,7 @@ THIS APPLICATION WRITES. Every path defaults to not writing, and a live run need
 dry_run=false AND confirm=="CLONE" AND a token. CAT offers no rollback, so read the
 safety notes in README.md before running anything live.
 """
-import json, os, pathlib, datetime, http.server, socketserver, threading
+import json, os, pathlib, datetime, http.server, socketserver, threading, socket, time
 import clone_capture as cc
 import clone_apply as capp
 import clone_cleanup as ccl
@@ -23,7 +23,15 @@ import clone_cleanup as ccl
 HERE = pathlib.Path(__file__).parent
 # Overridable so the page can be served on whatever port the registered Okta login redirect
 # URI names (CLONE_PORT=<port>). The Okta redirect_uri below follows this value.
-PORT = int(os.environ.get("CLONE_PORT", "8788"))
+PORT = int(os.environ.get("CLONE_PORT") or os.environ.get("PORT") or "8788")
+# Bind address. Loopback by default — the server has no auth of its own beyond the CAT
+# token each request carries, so it must not be reachable from a network you do not trust.
+# The container (Dockerfile) sets HOST=0.0.0.0 so the platform's proxy can reach it.
+HOST = os.environ.get("HOST") or "127.0.0.1"
+# The URL users reach the page at, when hosted (e.g. https://clone.sandbox.ckotech.co). It
+# becomes the Okta redirect_uri and, like http://localhost:8788/, has to be registered on
+# both Okta apps before sign-in works; pasting a token works regardless. Unset locally.
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or "").strip().rstrip("/")
 # Where the SOURCE is read from, by mode (the page's Sandbox → Sandbox / Prod → Sandbox
 # toggle, sent as source_env). Hosts from the CAT swagger's servers list. Writes — apply,
 # verify, cleanup — ALWAYS go to the sandbox: TARGET_CAT_BASE never varies.
@@ -90,10 +98,13 @@ OKTA_SCOPE = "openid profile clientadmin-tool"
 def okta_config(port=None):
     """What the page needs to start a login. Public values only; nothing here is a secret."""
     return {"envs": OKTA, "scope": OKTA_SCOPE,
-            "redirect_uri": f"http://localhost:{port or PORT}/"}
+            "redirect_uri": (PUBLIC_URL + "/") if PUBLIC_URL else f"http://localhost:{port or PORT}/"}
 # Live clone runs journal here, one .jsonl per run. Gitignored: contains
 # real created-object ids from a write run.
-RUNS_DIR = HERE.parent / "clone-runs"
+# CLONE_RUNS_DIR overrides it for a hosted deployment (the container uses /data/clone-runs,
+# the platform's durable mount, so journals survive a redeploy).
+RUNS_DIR = pathlib.Path(os.environ["CLONE_RUNS_DIR"]) if os.environ.get("CLONE_RUNS_DIR") \
+    else HERE.parent / "clone-runs"
 
 # The optional Checkout sandbox API keys, alongside the CAT token:
 # (request field, key role, required prefix, label on the page). Two secret keys because a
@@ -139,6 +150,51 @@ def reachability_note(reader, code):
     if code in (401, 403):
         return f"HTTP {code} from {reader.base} — the token was refused (expired, or for the other environment?)"
     return f"HTTP {code} from {reader.base} (check the client id and that the token is valid/unexpired)"
+
+
+STARTED_AT = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def probe(host, port=443, timeout=3.0):
+    """Can this server reach `host`? DNS, then a TCP connect to 443 — nothing is sent.
+
+    Answers in three seconds what a capture takes thirty to report: the CAT hosts resolve
+    to private, VPN-only addresses, and a container off the VPN sees the name resolve and
+    the packets vanish. That is the first question a hosted deployment has to answer.
+    """
+    out = {"host": host}
+    try:
+        ip = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)[0][4][0]
+        out["dns"] = ip
+    except Exception as e:
+        out["dns"] = f"error: {type(e).__name__}: {e}"
+        out["tcp443"] = "not attempted"
+        return out
+    t0 = time.time()
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            out["tcp443"] = "ok"
+    except Exception as e:
+        out["tcp443"] = f"error: {type(e).__name__}: {e}"
+    out["ms"] = int((time.time() - t0) * 1000)
+    return out
+
+
+def health_handler():
+    """GET /api/health — token-free, read-only: can this deployment do its job?"""
+    hosts = {"cat_sandbox": CAT_BASES["sandbox"], "cat_prod": CAT_BASES["prod"],
+             "nt_portal": cc.NT_PORTAL_BASE, "sandbox_api": cc.SANDBOX_API_BASE}
+    reach = {k: probe(v.split("//", 1)[1].split("/", 1)[0]) for k, v in hosts.items()}
+    try:
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        writable = os.access(RUNS_DIR, os.W_OK)
+    except Exception:
+        writable = False
+    return {"ok": True, "started_at": STARTED_AT, "public_url": PUBLIC_URL or None,
+            "bind": f"{HOST}:{PORT}", "runs_dir": str(RUNS_DIR), "runs_dir_writable": writable,
+            "reach": reach,
+            # the one that decides whether a sandbox -> sandbox capture can work at all
+            "can_capture_sandbox": reach["cat_sandbox"].get("tcp443") == "ok"}
 
 
 def clone_capture_handler(payload):
@@ -456,6 +512,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/clone", "/clone.html"):
             self._page("clone.html")
+        elif self.path == "/api/health":
+            self._send(200, json.dumps(health_handler()), "application/json")
         else:
             self._send(404, json.dumps({"error":"not found"}))
     def do_POST(self):
@@ -500,6 +558,7 @@ class Server(socketserver.ThreadingTCPServer):
 
 
 if __name__ == "__main__":
-    with Server(("127.0.0.1", PORT), Handler) as httpd:
-        print(f"Sandbox CAT client clone -> http://localhost:{PORT}")
+    with Server((HOST, PORT), Handler) as httpd:
+        print(f"Sandbox CAT client clone -> {PUBLIC_URL or f'http://localhost:{PORT}'} "
+              f"(bound to {HOST}:{PORT}; runs in {RUNS_DIR})", flush=True)
         httpd.serve_forever()

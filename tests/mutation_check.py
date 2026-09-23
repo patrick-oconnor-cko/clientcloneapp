@@ -644,6 +644,19 @@ MUTATIONS = [
      '        elif missing_manual:',
      '        elif False:'),
 
+    # -- deployment: a failed or non-JSON response must never vanish silently -------------
+    ("page swallows a non-JSON response again (bare r.json())", "app/clone.html",
+     '  const text=await r.text();\n  try{ return {code:r.status, body:JSON.parse(text)}; }',
+     '  return {code:r.status, body:await r.json()};\n  try{ throw 0; }'),
+    ("a black-holed CAT host is not probed (health says ok)", "app/server.py",
+     '        with socket.create_connection((ip, port), timeout=timeout):\n            out["tcp443"] = "ok"',
+     '        out["tcp443"] = "ok"'),
+
+    # -- deployment: a hosted instance must send Okta back to its own URL ----------------
+    ("PUBLIC_URL ignored — hosted Okta redirect stays localhost", "app/server.py",
+     '            "redirect_uri": (PUBLIC_URL + "/") if PUBLIC_URL else f"http://localhost:{port or PORT}/"}',
+     '            "redirect_uri": f"http://localhost:{port or PORT}/"}'),
+
     # -- Okta SSO: the two environments' Okta apps must never be mixed up --------------
     ("sandbox sign-in pointed at the prod Okta authorization server", "app/server.py",
      '    "sandbox": {"issuer": "https://checkout.oktapreview.com/oauth2/ausskuj3xaCB7FT2g0h7",',
